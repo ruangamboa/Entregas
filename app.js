@@ -335,7 +335,7 @@ function renderPainel() {
       r.diasAte > 0 ? `em ${r.diasAte} dia${r.diasAte > 1 ? 's' : ''}` :
       `${Math.abs(r.diasAte)} dia${Math.abs(r.diasAte) > 1 ? 's' : ''} atrás`;
     return `
-      <div class="card">
+      <div class="card" onclick="openClienteDetalhe('${c.id}')" style="cursor:pointer;">
         <div class="card-row">
           <div>
             <div class="card-title">${escapeHtml(c.nome)}</div>
@@ -348,6 +348,41 @@ function renderPainel() {
         </div>
       </div>`;
   }).join('');
+}
+
+function openClienteDetalhe(clienteId) {
+  const cliente = DB.clientes.find(c => c.id === clienteId);
+  if (!cliente) return;
+  const lista = entregasDoCliente(cliente.nome); // ja vem ordenada da mais recente pra mais antiga
+
+  const totalQtd = lista.reduce((s, e) => s + (Number(e.quantidade) || 0), 0);
+
+  const linhasHtml = lista.length === 0
+    ? emptyState('🚚', 'Nenhuma entrega registrada', 'Ainda não há entregas lançadas para essa loja.')
+    : lista.map(e => {
+        const valor = valorTotalEntrega(e);
+        const pago = !!e.dataPagamento;
+        return `
+          <div class="card" onclick="closeModal(); openEntregaForm('${e.id}')" style="cursor:pointer;">
+            <div class="card-row">
+              <div>
+                <div class="card-title">${fmtDateBR(e.data)}</div>
+                <div class="card-sub">${e.quantidade} un.${valor > 0 ? ' · ' + fmtMoney(valor) : ''}</div>
+              </div>
+              <span class="badge ${pago ? 'green' : 'amber'}">${pago ? 'Pago' : 'Pendente'}</span>
+            </div>
+          </div>`;
+      }).join('');
+
+  const html = `
+    <div class="modal-header">
+      <h2>${escapeHtml(cliente.nome)}</h2>
+      <button class="close-x" onclick="closeModal()">✕</button>
+    </div>
+    ${lista.length > 0 ? `<div class="hint" style="margin-bottom:12px;">${lista.length} entrega${lista.length > 1 ? 's' : ''} registrada${lista.length > 1 ? 's' : ''} · ${totalQtd} un. no total. Toque numa entrega para editar.</div>` : ''}
+    ${linhasHtml}
+  `;
+  openModal(html);
 }
 
 /* =========================================================
@@ -503,6 +538,117 @@ function marcarComoPago(id) {
   saveDB();
   refreshAll();
   toast('Pagamento registrado.');
+}
+
+/* ---------------- Exportar pendências como imagem ---------------- */
+async function exportarPagamentosImagem() {
+  const pend = getPendencias();
+  if (pend.length === 0) {
+    toast('Nada pendente para exportar.');
+    return;
+  }
+
+  const WIDTH = 800;
+  const PAD = 32;
+  const ROW_H = 66;
+  const HEADER_H = 158;
+  const FOOTER_H = 46;
+  const height = HEADER_H + pend.length * ROW_H + FOOTER_H;
+
+  const scale = 2;
+  const canvas = document.createElement('canvas');
+  canvas.width = WIDTH * scale;
+  canvas.height = height * scale;
+  const ctx = canvas.getContext('2d');
+  ctx.scale(scale, scale);
+
+  // fundo
+  ctx.fillStyle = '#FAFAF8';
+  ctx.fillRect(0, 0, WIDTH, height);
+
+  // faixa do cabecalho
+  const grad = ctx.createLinearGradient(0, 0, WIDTH, 0);
+  grad.addColorStop(0, '#0E7C7B');
+  grad.addColorStop(1, '#0A4F4E');
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, WIDTH, HEADER_H);
+
+  ctx.fillStyle = '#FFFFFF';
+  ctx.font = '700 25px Roboto, Arial, sans-serif';
+  ctx.fillText('Pagamentos pendentes a receber', PAD, 46);
+
+  ctx.font = '400 14px Roboto, Arial, sans-serif';
+  ctx.globalAlpha = 0.85;
+  ctx.fillText(`Gerado em ${new Date().toLocaleDateString('pt-BR')} · Entregas Picolé`, PAD, 70);
+  ctx.globalAlpha = 1;
+
+  ctx.font = '400 13px Roboto, Arial, sans-serif';
+  ctx.globalAlpha = 0.8;
+  ctx.fillText('TOTAL PENDENTE', PAD, 106);
+  ctx.globalAlpha = 1;
+  ctx.font = '800 32px Roboto, Arial, sans-serif';
+  ctx.fillText(fmtMoney(getTotalPendente()), PAD, 138);
+
+  // linhas
+  let y = HEADER_H;
+  pend.forEach((p, i) => {
+    if (i % 2 === 1) {
+      ctx.fillStyle = '#F0F4F4';
+      ctx.fillRect(0, y, WIDTH, ROW_H);
+    }
+    ctx.fillStyle = '#1F2933';
+    ctx.font = '700 19px Roboto, Arial, sans-serif';
+    ctx.fillText(p.cliente, PAD, y + 28);
+
+    ctx.fillStyle = '#5C6B73';
+    ctx.font = '400 14px Roboto, Arial, sans-serif';
+    ctx.fillText(`Entrega de ${fmtDateBR(p.data)}`, PAD, y + 48);
+
+    ctx.fillStyle = '#E5502F';
+    ctx.font = '700 20px Roboto, Arial, sans-serif';
+    const valorTxt = fmtMoney(p.valor);
+    const w = ctx.measureText(valorTxt).width;
+    ctx.fillText(valorTxt, WIDTH - PAD - w, y + 38);
+
+    ctx.strokeStyle = '#E7ECEC';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(PAD, y + ROW_H - 1);
+    ctx.lineTo(WIDTH - PAD, y + ROW_H - 1);
+    ctx.stroke();
+
+    y += ROW_H;
+  });
+
+  // rodape
+  ctx.fillStyle = '#5C6B73';
+  ctx.font = '400 12.5px Roboto, Arial, sans-serif';
+  ctx.fillText(`${pend.length} entrega${pend.length > 1 ? 's' : ''} pendente${pend.length > 1 ? 's' : ''}`, PAD, y + 28);
+
+  canvas.toBlob(async (blob) => {
+    if (!blob) { toast('Não foi possível gerar a imagem.'); return; }
+    const nomeArquivo = `Pagamentos_Pendentes_${todayStr()}.png`;
+    const file = new File([blob], nomeArquivo, { type: 'image/png' });
+
+    if (navigator.canShare && navigator.canShare({ files: [file] })) {
+      try {
+        await navigator.share({ files: [file], title: 'Pagamentos pendentes' });
+        return;
+      } catch (err) {
+        if (err && err.name === 'AbortError') return; // usuario cancelou o compartilhamento
+        // se falhar por outro motivo, cai no download abaixo
+      }
+    }
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = nomeArquivo;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1500);
+    toast('Imagem salva.');
+  }, 'image/png');
 }
 
 /* =========================================================
