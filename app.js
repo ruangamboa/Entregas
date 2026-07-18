@@ -3,7 +3,11 @@
    ========================================================= */
 
 const STORAGE_KEY = 'picole_data_v1';
+const SYNC_CONFIG_KEY = 'picole_sync_config';
+const LAST_SYNC_KEY = 'picole_last_sync';
 const SHEETJS_URL = 'https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js';
+const FIREBASE_APP_URL = 'https://www.gstatic.com/firebasejs/12.15.0/firebase-app-compat.js';
+const FIREBASE_FIRESTORE_URL = 'https://www.gstatic.com/firebasejs/12.15.0/firebase-firestore-compat.js';
 
 const FERIADOS_PADRAO = [
   ['2026-01-01', 'Confraternização Universal'],
@@ -56,6 +60,133 @@ function loadDB() {
 
 function saveDB() {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(DB));
+  agendarPushNuvem();
+}
+
+/* ---------------- Sincronização na nuvem (opcional) ---------------- */
+let SYNC_CONFIG = null; // { firebaseConfig: {...}, syncCode: '...' } ou null
+let firebaseReady = null;
+let pushTimer = null;
+
+function carregarConfigSync() {
+  try {
+    const raw = localStorage.getItem(SYNC_CONFIG_KEY);
+    SYNC_CONFIG = raw ? JSON.parse(raw) : null;
+  } catch (e) {
+    SYNC_CONFIG = null;
+  }
+}
+
+function ensureFirebase() {
+  if (!SYNC_CONFIG) return Promise.reject(new Error('Sincronização não configurada'));
+  if (firebaseReady) return firebaseReady;
+  firebaseReady = new Promise((resolve, reject) => {
+    const s1 = document.createElement('script');
+    s1.src = FIREBASE_APP_URL;
+    s1.onload = () => {
+      const s2 = document.createElement('script');
+      s2.src = FIREBASE_FIRESTORE_URL;
+      s2.onload = () => {
+        try {
+          if (!firebase.apps || firebase.apps.length === 0) {
+            firebase.initializeApp(SYNC_CONFIG.firebaseConfig);
+          }
+          resolve();
+        } catch (err) {
+          reject(err);
+        }
+      };
+      s2.onerror = () => reject(new Error('Falha ao carregar Firestore (sem internet?)'));
+      document.head.appendChild(s2);
+    };
+    s1.onerror = () => reject(new Error('Falha ao carregar Firebase (sem internet?)'));
+    document.head.appendChild(s1);
+  });
+  return firebaseReady;
+}
+
+function parseFirebaseConfigText(text) {
+  const get = (key) => {
+    const m = text.match(new RegExp(key + '\\s*:\\s*["\']([^"\']*)["\']'));
+    return m ? m[1] : '';
+  };
+  return {
+    apiKey: get('apiKey'),
+    authDomain: get('authDomain'),
+    projectId: get('projectId'),
+    storageBucket: get('storageBucket'),
+    messagingSenderId: get('messagingSenderId'),
+    appId: get('appId'),
+  };
+}
+
+function gerarCodigoSync() {
+  const chars = 'ABCDEFGHJKMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789';
+  let s = '';
+  for (let i = 0; i < 28; i++) s += chars[Math.floor(Math.random() * chars.length)];
+  return s;
+}
+
+function agendarPushNuvem() {
+  if (!SYNC_CONFIG) return;
+  clearTimeout(pushTimer);
+  pushTimer = setTimeout(() => { pushParaNuvem(); }, 1500);
+}
+
+async function pushParaNuvem() {
+  // usado apos uma edicao local: sempre manda o que esta aqui pra nuvem,
+  // sem comparar com o que ja esta la (a edicao que a pessoa acabou de
+  // fazer neste aparelho tem prioridade sobre o que estiver na nuvem).
+  if (!SYNC_CONFIG) return;
+  try {
+    await ensureFirebase();
+    const now = Date.now();
+    DB._updatedAt = now;
+    const ref = firebase.firestore().collection('sincronizacoes').doc(SYNC_CONFIG.syncCode);
+    await ref.set({ json: JSON.stringify(DB), updatedAt: now });
+    localStorage.setItem(LAST_SYNC_KEY, String(now));
+    if (typeof renderSyncStatus === 'function') renderSyncStatus();
+  } catch (err) {
+    console.error('push para nuvem falhou', err);
+  }
+}
+
+async function sincronizar(silencioso) {
+  // usado ao abrir o app e no botao "Sincronizar agora": compara com a
+  // nuvem e traz dados mais novos de outro aparelho, se houver.
+  if (!SYNC_CONFIG) return;
+  if (!silencioso) toast('Sincronizando…');
+  try {
+    await ensureFirebase();
+    const ref = firebase.firestore().collection('sincronizacoes').doc(SYNC_CONFIG.syncCode);
+    const snap = await ref.get();
+    const cloudData = snap.exists ? snap.data() : null;
+    const localUpdatedAt = DB._updatedAt || 0;
+
+    if (cloudData && cloudData.updatedAt > localUpdatedAt) {
+      // nuvem tem versao mais nova (outro aparelho sincronizou depois) -> traz pra local
+      DB = JSON.parse(cloudData.json);
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(DB));
+      if (typeof refreshAll === 'function') refreshAll();
+      if (!silencioso) toast('Dados atualizados a partir da nuvem.');
+    } else {
+      // local esta em dia ou mais novo -> manda pra nuvem
+      const now = Date.now();
+      DB._updatedAt = now;
+      await ref.set({ json: JSON.stringify(DB), updatedAt: now });
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(DB));
+      if (!silencioso) toast(cloudData ? 'Dados enviados para a nuvem.' : 'Primeira sincronização concluída.');
+    }
+    localStorage.setItem(LAST_SYNC_KEY, String(Date.now()));
+  } catch (err) {
+    console.error('sincronizar falhou', err);
+    if (!silencioso) toast('Não foi possível sincronizar. Verifique sua internet.');
+  }
+  if (typeof renderSyncStatus === 'function') renderSyncStatus();
+}
+
+function sincronizarAgora() {
+  sincronizar(false);
 }
 
 /* ---------------- Utilidades de data ---------------- */
@@ -293,7 +424,7 @@ function renderScreen(name) {
 
 function refreshAll() {
   renderPainel(); renderEntregas(); renderPagamentos();
-  renderClientes(); renderResumo(); renderFeriados();
+  renderClientes(); renderResumo(); renderFeriados(); renderSyncStatus();
 }
 
 /* ---------------- Toast ---------------- */
@@ -959,6 +1090,107 @@ function confirmarLimpeza() {
   toast('Dados apagados.');
 }
 
+/* ---------------- UI de sincronização ---------------- */
+function renderSyncStatus() {
+  const el = document.getElementById('sync-status-card');
+  if (!el) return;
+  if (!SYNC_CONFIG) {
+    el.innerHTML = `
+      <div class="settings-item" onclick="abrirConfigSync()" style="cursor:pointer;">
+        <div><div class="t">Sincronização e backup na nuvem</div><div class="d">Desativada — toque para configurar</div></div>
+        <div>›</div>
+      </div>`;
+    return;
+  }
+  const lastSync = localStorage.getItem(LAST_SYNC_KEY);
+  const lastTxt = lastSync ? new Date(Number(lastSync)).toLocaleString('pt-BR') : 'ainda não';
+  el.innerHTML = `
+    <div class="settings-item">
+      <div><div class="t">Sincronização ativa</div><div class="d">Última sincronização: ${lastTxt}</div></div>
+    </div>
+    <button class="btn ghost block" style="margin:4px 0 8px;" onclick="sincronizarAgora()">🔄 Sincronizar agora</button>
+    <button class="btn ghost block" style="margin-bottom:8px;" onclick="mostrarCodigoGerado('${SYNC_CONFIG.syncCode}')">Ver código de sincronização</button>
+    <button class="danger-link" onclick="desconectarSync()">Desconectar sincronização deste aparelho</button>
+  `;
+}
+
+function abrirConfigSync() {
+  const atual = SYNC_CONFIG;
+  const html = `
+    <div class="modal-header">
+      <h2>Sincronização na nuvem</h2>
+      <button class="close-x" onclick="closeModal()">✕</button>
+    </div>
+    <div class="hint" style="margin-bottom:14px;">
+      Cole abaixo a configuração do seu projeto Firebase (o bloco com apiKey, projectId etc. que aparece no console do Firebase, em Configurações do projeto → Seus apps).
+    </div>
+    <div class="field">
+      <label>Configuração do Firebase</label>
+      <textarea id="f-firebase-config" placeholder="Cole aqui o firebaseConfig" style="min-height:110px;">${atual ? escapeHtml(JSON.stringify(atual.firebaseConfig, null, 2)) : ''}</textarea>
+    </div>
+    <div class="field">
+      <label>Código de sincronização</label>
+      <input type="text" id="f-sync-code" value="${atual ? atual.syncCode : ''}" placeholder="Deixe em branco para criar um novo">
+      <div class="hint">Deixe em branco se este for o primeiro aparelho (um código novo é criado). Se já tiver um código de outro aparelho, cole ele aqui.</div>
+    </div>
+    <div class="formbtns">
+      <button class="btn ghost block" onclick="closeModal()">Cancelar</button>
+      <button class="btn primary block" onclick="salvarConfigSyncUI()">Salvar</button>
+    </div>
+  `;
+  openModal(html);
+}
+
+function salvarConfigSyncUI() {
+  const text = document.getElementById('f-firebase-config').value;
+  const parsed = parseFirebaseConfigText(text);
+  if (!parsed.apiKey || !parsed.projectId) {
+    toast('Não consegui entender essa configuração. Confira se colou o bloco certo.');
+    return;
+  }
+  let code = document.getElementById('f-sync-code').value.trim();
+  const novoCodigo = !code;
+  if (!code) code = gerarCodigoSync();
+
+  SYNC_CONFIG = { firebaseConfig: parsed, syncCode: code };
+  localStorage.setItem(SYNC_CONFIG_KEY, JSON.stringify(SYNC_CONFIG));
+  firebaseReady = null; // forca reinicializar com a config nova
+  closeModal();
+  renderSyncStatus();
+
+  if (novoCodigo) {
+    toast('Sincronização configurada!');
+    pushParaNuvem();
+    setTimeout(() => mostrarCodigoGerado(code), 300);
+  } else {
+    sincronizar(false);
+  }
+}
+
+function mostrarCodigoGerado(code) {
+  const html = `
+    <div class="modal-header">
+      <h2>Seu código de sincronização</h2>
+      <button class="close-x" onclick="closeModal()">✕</button>
+    </div>
+    <div class="hint" style="margin-bottom:10px;">Guarde este código. Use-o para conectar outros aparelhos aos mesmos dados: em Mais → Sincronização, cole a mesma configuração do Firebase e este código.</div>
+    <div class="card" style="text-align:center;">
+      <div style="font-size:20px;font-weight:800;letter-spacing:.03em;font-family:monospace;color:var(--teal-900);word-break:break-all;">${code}</div>
+    </div>
+    <button class="btn primary block" style="margin-top:14px;" onclick="closeModal()">Entendi</button>
+  `;
+  openModal(html);
+}
+
+function desconectarSync() {
+  if (!confirm('Isso para de sincronizar este aparelho (os dados salvos aqui continuam, só param de se atualizar com a nuvem). Continuar?')) return;
+  SYNC_CONFIG = null;
+  localStorage.removeItem(SYNC_CONFIG_KEY);
+  closeModal();
+  renderSyncStatus();
+  toast('Sincronização desconectada.');
+}
+
 /* =========================================================
    Importar / Exportar planilha (.xlsx) — via SheetJS (CDN)
    ========================================================= */
@@ -1146,5 +1378,9 @@ async function exportarPlanilha() {
 /* =========================================================
    Inicialização
    ========================================================= */
+carregarConfigSync();
 loadDB();
 refreshAll();
+if (SYNC_CONFIG) {
+  sincronizar(true);
+}
