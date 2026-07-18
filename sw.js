@@ -1,4 +1,8 @@
-const CACHE = 'picole-shell-v1';
+// v2: estrategia "network-first" -- sempre tenta buscar a versao mais nova
+// primeiro; so usa o cache guardado quando estiver realmente offline.
+// (a v1 fazia cache-first e ficava presa em versoes antigas do app.js
+// depois de cada atualizacao — corrigido aqui.)
+const CACHE = 'picole-shell-v2';
 const SHELL = ['./index.html', './app.js', './manifest.json', './icon-192.png', './icon-512.png'];
 
 self.addEventListener('install', (event) => {
@@ -21,19 +25,17 @@ self.addEventListener('fetch', (event) => {
   const url = new URL(event.request.url);
   // nunca intercepta chamadas externas (ex: biblioteca de importar/exportar via CDN)
   if (url.origin !== self.location.origin) return;
+  if (event.request.method !== 'GET') return;
 
   event.respondWith(
-    caches.match(event.request).then((cached) => {
-      const network = fetch(event.request)
-        .then((resp) => {
-          if (resp && resp.ok) {
-            const clone = resp.clone();
-            caches.open(CACHE).then((cache) => cache.put(event.request, clone));
-          }
-          return resp;
-        })
-        .catch(() => cached);
-      return cached || network;
-    })
+    fetch(event.request)
+      .then((resp) => {
+        if (resp && resp.ok) {
+          const clone = resp.clone();
+          caches.open(CACHE).then((cache) => cache.put(event.request, clone));
+        }
+        return resp;
+      })
+      .catch(() => caches.match(event.request))
   );
 });

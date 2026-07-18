@@ -324,8 +324,12 @@ function renderPainel() {
     return;
   }
   const linhas = ativos.map(c => ({ c, r: calcPainelCliente(c) }));
-  const ordem = { 'Atrasado': 0, 'Em breve': 1, 'No prazo': 2, 'Sem histórico': 3 };
-  linhas.sort((a, b) => (ordem[a.r.status] - ordem[b.r.status]) || a.c.nome.localeCompare(b.c.nome));
+  linhas.sort((a, b) => {
+    if (a.r.diasAte === null && b.r.diasAte === null) return a.c.nome.localeCompare(b.c.nome);
+    if (a.r.diasAte === null) return 1;
+    if (b.r.diasAte === null) return -1;
+    return a.r.diasAte - b.r.diasAte;
+  });
 
   el.innerHTML = linhas.map(({ c, r }) => {
     const proxima = r.proximaEntrega ? fmtDateBR(r.proximaEntrega) : '—';
@@ -484,6 +488,9 @@ function saveEntrega(id) {
   }
 
   if (id) {
+    if (!confirm('Salvar as alterações feitas nesta entrega?')) {
+      return;
+    }
     const e = DB.entregas.find(x => x.id === id);
     Object.assign(e, { cliente, data, quantidade, observacoes, valorUnitario, dataPagamento, obsPagamento });
   } else {
@@ -526,18 +533,78 @@ function renderPagamentos() {
           <div class="card-title" style="color:var(--coral-dark);">${fmtMoney(p.valor)}</div>
         </div>
       </div>
-      <button class="btn ghost small" style="margin-top:10px;" onclick="marcarComoPago('${p.id}')">Marcar como pago hoje</button>
+      <button class="btn ghost small" style="margin-top:10px;" onclick="abrirConfirmacaoPagamento('${p.id}')">Marcar como pago</button>
     </div>
   `).join('');
 }
 
-function marcarComoPago(id) {
+function abrirConfirmacaoPagamento(entregaId) {
+  const e = DB.entregas.find(x => x.id === entregaId);
+  if (!e) return;
+  const html = `
+    <div class="modal-header">
+      <h2>Confirmar pagamento</h2>
+      <button class="close-x" onclick="closeModal()">✕</button>
+    </div>
+    <div class="hint" style="margin-bottom:14px;">${escapeHtml(e.cliente)} · Entrega de ${fmtDateBR(e.data)} · ${fmtMoney(valorTotalEntrega(e))}</div>
+    <div class="field">
+      <label>Data do pagamento</label>
+      <input type="date" id="f-confirma-data-pagto" value="${todayStr()}">
+    </div>
+    <div class="field">
+      <label>Observações do pagamento</label>
+      <textarea id="f-confirma-obs-pagto" placeholder="Opcional">${escapeHtml(e.obsPagamento || '')}</textarea>
+    </div>
+    <div class="formbtns">
+      <button class="btn ghost block" onclick="closeModal()">Cancelar</button>
+      <button class="btn primary block" onclick="confirmarPagamento('${entregaId}')">Confirmar pagamento</button>
+    </div>
+  `;
+  openModal(html);
+}
+
+function confirmarPagamento(id) {
   const e = DB.entregas.find(x => x.id === id);
   if (!e) return;
-  e.dataPagamento = todayStr();
+  const data = document.getElementById('f-confirma-data-pagto').value;
+  if (!data) { toast('Escolha a data do pagamento.'); return; }
+  e.dataPagamento = data;
+  e.obsPagamento = document.getElementById('f-confirma-obs-pagto').value.trim();
   saveDB();
+  closeModal();
   refreshAll();
-  toast('Pagamento registrado.');
+  toast('Pagamento confirmado.');
+}
+
+function abrirHistoricoPagos() {
+  const pagos = DB.entregas
+    .filter(e => e.dataPagamento)
+    .slice()
+    .sort((a, b) => (a.dataPagamento < b.dataPagamento ? 1 : a.dataPagamento > b.dataPagamento ? -1 : 0));
+
+  const linhasHtml = pagos.length === 0
+    ? emptyState('🧾', 'Nenhum pagamento registrado', 'Assim que marcar uma entrega como paga, ela aparece aqui.')
+    : pagos.map(e => `
+        <div class="card" onclick="closeModal(); openEntregaForm('${e.id}')" style="cursor:pointer;">
+          <div class="card-row">
+            <div>
+              <div class="card-title">${escapeHtml(e.cliente)}</div>
+              <div class="card-sub">Entrega de ${fmtDateBR(e.data)} · Pago em ${fmtDateBR(e.dataPagamento)}</div>
+            </div>
+            <div class="card-title" style="color:var(--teal-700);">${fmtMoney(valorTotalEntrega(e))}</div>
+          </div>
+        </div>
+      `).join('');
+
+  const html = `
+    <div class="modal-header">
+      <h2>Pagamentos realizados</h2>
+      <button class="close-x" onclick="closeModal()">✕</button>
+    </div>
+    ${pagos.length > 0 ? `<div class="hint" style="margin-bottom:12px;">Do mais recente para o mais antigo. Toque para editar.</div>` : ''}
+    ${linhasHtml}
+  `;
+  openModal(html);
 }
 
 /* ---------------- Exportar pendências como imagem ---------------- */
@@ -579,7 +646,7 @@ async function exportarPagamentosImagem() {
 
   ctx.font = '400 14px Roboto, Arial, sans-serif';
   ctx.globalAlpha = 0.85;
-  ctx.fillText(`Gerado em ${new Date().toLocaleDateString('pt-BR')} · Entregas Picolé`, PAD, 70);
+  ctx.fillText(`Gerado em ${new Date().toLocaleDateString('pt-BR')} · Entregas Picolés`, PAD, 70);
   ctx.globalAlpha = 1;
 
   ctx.font = '400 13px Roboto, Arial, sans-serif';
