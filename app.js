@@ -8,6 +8,7 @@ const LAST_SYNC_KEY = 'picole_last_sync';
 const SHEETJS_URL = 'https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js';
 const FIREBASE_APP_URL = 'https://www.gstatic.com/firebasejs/12.15.0/firebase-app-compat.js';
 const FIREBASE_FIRESTORE_URL = 'https://www.gstatic.com/firebasejs/12.15.0/firebase-firestore-compat.js';
+const FIREBASE_AUTH_URL = 'https://www.gstatic.com/firebasejs/12.15.0/firebase-auth-compat.js';
 
 const FERIADOS_PADRAO = [
   ['2026-01-01', 'Confraternização Universal'],
@@ -63,10 +64,19 @@ function saveDB() {
   agendarPushNuvem();
 }
 
-/* ---------------- Sincronização na nuvem (opcional) ---------------- */
-let SYNC_CONFIG = null; // { firebaseConfig: {...}, syncCode: '...' } ou null
+/* =========================================================
+   Sincronização na nuvem (opcional) — Firestore
+   - clientes/feriados: um "blob" só, gerenciado pelo admin
+   - entregas: um documento por entrega, mesclados por updatedAt
+     (permite colaboradores lançarem entregas sem mexer em clientes)
+   - usuarios: papel de cada e-mail (admin | colaborador)
+   ========================================================= */
+let SYNC_CONFIG = null; // { firebaseConfig: {...}, syncCode: '...'|null }
+let AUTH_USER = null;   // { email, nome } quando logado com Google, ou null
+let MEU_PAPEL = null;   // 'admin' | 'colaborador' | null (calculado apos login)
 let firebaseReady = null;
 let pushTimer = null;
+let lastCloudPushAt = 0;
 
 function carregarConfigSync() {
   try {
@@ -75,6 +85,7 @@ function carregarConfigSync() {
   } catch (e) {
     SYNC_CONFIG = null;
   }
+  lastCloudPushAt = Number(localStorage.getItem('picole_last_push_at') || 0);
 }
 
 function ensureFirebase() {
@@ -87,14 +98,25 @@ function ensureFirebase() {
       const s2 = document.createElement('script');
       s2.src = FIREBASE_FIRESTORE_URL;
       s2.onload = () => {
-        try {
-          if (!firebase.apps || firebase.apps.length === 0) {
-            firebase.initializeApp(SYNC_CONFIG.firebaseConfig);
+        const s3 = document.createElement('script');
+        s3.src = FIREBASE_AUTH_URL;
+        s3.onload = () => {
+          try {
+            if (!firebase.apps || firebase.apps.length === 0) {
+              firebase.initializeApp(SYNC_CONFIG.firebaseConfig);
+              firebase.auth().onAuthStateChanged((user) => {
+                AUTH_USER = user ? { email: user.email, nome: user.displayName || user.email } : null;
+                atualizarPapelEDataAposLogin();
+              });
+              firebase.auth().getRedirectResult().catch((err) => console.error('login redirect falhou', err));
+            }
+            resolve();
+          } catch (err) {
+            reject(err);
           }
-          resolve();
-        } catch (err) {
-          reject(err);
-        }
+        };
+        s3.onerror = () => reject(new Error('Falha ao carregar Firebase Auth (sem internet?)'));
+        document.head.appendChild(s3);
       };
       s2.onerror = () => reject(new Error('Falha ao carregar Firestore (sem internet?)'));
       document.head.appendChild(s2);
@@ -127,6 +149,115 @@ function gerarCodigoSync() {
   return s;
 }
 
+/* ---------------- login com Google ---------------- */
+async function loginComGoogle() {
+  if (!SYNC_CONFIG || !SYNC_CONFIG.firebaseConfig || !SYNC_CONFIG.firebaseConfig.apiKey) {
+    toast('Cole a configuração do Firebase antes de entrar com Google.');
+    return;
+  }
+  try {
+    await ensureFirebase();
+    const provider = new firebase.auth.GoogleAuthProvider();
+    await firebase.auth().signInWithRedirect(provider);
+  } catch (err) {
+    console.error(err);
+    toast('Não foi possível iniciar o login com Google.');
+  }
+}
+
+function logoutGoogle() {
+  if (!firebaseReady) return;
+  ensureFirebase().then(() => firebase.auth().signOut()).catch(() => {});
+  AUTH_USER = null;
+  MEU_PAPEL = null;
+  renderSyncStatus();
+}
+
+async function atualizarPapelEDataAposLogin() {
+  if (!AUTH_USER) { MEU_PAPEL = null; renderSyncStatus(); return; }
+  try {
+    // se ja estou ligado a um codigo, so confere meu papel nele
+    if (SYNC_CONFIG.syncCode) {
+      const doc = await firebase.firestore()
+        .collection('sincronizacoes').doc(SYNC_CONFIG.syncCode)
+        .collection('usuarios').doc(AUTH_USER.email).get();
+      MEU_PAPEL = doc.exists ? doc.data().papel : null;
+    } else {
+      // ainda sem codigo -> procura em quais sincronizacoes esse e-mail foi convidado
+      const q = await firebase.firestore()
+        .collectionGroup('usuarios')
+        .where('email', '==', AUTH_USER.email)
+        .get();
+      if (!q.empty) {
+        const doc = q.docs[0];
+        const codigo = doc.ref.parent.parent.id;
+        SYNC_CONFIG.syncCode = codigo;
+        localStorage.setItem(SYNC_CONFIG_KEY, JSON.stringify(SYNC_CONFIG));
+        MEU_PAPEL = doc.data().papel;
+        toast('Conectado à sincronização do seu convite.');
+        await sincronizar(true);
+      }
+    }
+  } catch (err) {
+    console.error('falha ao checar papel', err);
+  }
+  renderSyncStatus();
+}
+
+async function registrarComoAdmin() {
+  if (!AUTH_USER) { toast('Entre com Google primeiro.'); return; }
+  if (!SYNC_CONFIG || !SYNC_CONFIG.syncCode) { toast('Configure um código de sincronização primeiro.'); return; }
+  try {
+    await ensureFirebase();
+    await firebase.firestore()
+      .collection('sincronizacoes').doc(SYNC_CONFIG.syncCode)
+      .collection('usuarios').doc(AUTH_USER.email)
+      .set({ email: AUTH_USER.email, nome: AUTH_USER.nome, papel: 'admin', adicionadoEm: Date.now() });
+    MEU_PAPEL = 'admin';
+    toast('Sua conta Google agora é administradora deste código.');
+    renderSyncStatus();
+  } catch (err) {
+    console.error(err);
+    toast('Não foi possível registrar. Verifique as regras do Firestore.');
+  }
+}
+
+/* ---------------- gestão de usuários (só admin) ---------------- */
+async function listarUsuarios() {
+  if (!SYNC_CONFIG || !SYNC_CONFIG.syncCode) return [];
+  await ensureFirebase();
+  const snap = await firebase.firestore()
+    .collection('sincronizacoes').doc(SYNC_CONFIG.syncCode)
+    .collection('usuarios').get();
+  return snap.docs.map(d => d.data());
+}
+
+async function adicionarUsuario(email, papel) {
+  await ensureFirebase();
+  await firebase.firestore()
+    .collection('sincronizacoes').doc(SYNC_CONFIG.syncCode)
+    .collection('usuarios').doc(email)
+    .set({ email, papel, adicionadoEm: Date.now() });
+}
+
+async function removerUsuarioCloud(email) {
+  await ensureFirebase();
+  await firebase.firestore()
+    .collection('sincronizacoes').doc(SYNC_CONFIG.syncCode)
+    .collection('usuarios').doc(email)
+    .delete();
+}
+
+function podeGerenciar() {
+  // sem login (so pelo codigo) = acesso total, como antes.
+  // com login, so admin tem acesso de gestao (clientes/feriados/usuarios).
+  return !AUTH_USER || MEU_PAPEL === 'admin';
+}
+function podeEditarEntregas() {
+  return !AUTH_USER || MEU_PAPEL === 'admin' || MEU_PAPEL === 'colaborador';
+}
+
+/* ---------------- push/pull ---------------- */
 function agendarPushNuvem() {
   if (!SYNC_CONFIG) return;
   clearTimeout(pushTimer);
@@ -134,16 +265,33 @@ function agendarPushNuvem() {
 }
 
 async function pushParaNuvem() {
-  // usado apos uma edicao local: sempre manda o que esta aqui pra nuvem,
-  // sem comparar com o que ja esta la (a edicao que a pessoa acabou de
-  // fazer neste aparelho tem prioridade sobre o que estiver na nuvem).
-  if (!SYNC_CONFIG) return;
+  if (!SYNC_CONFIG || !SYNC_CONFIG.syncCode) return;
   try {
     await ensureFirebase();
     const now = Date.now();
-    DB._updatedAt = now;
     const ref = firebase.firestore().collection('sincronizacoes').doc(SYNC_CONFIG.syncCode);
-    await ref.set({ json: JSON.stringify(DB), updatedAt: now });
+
+    if (podeGerenciar()) {
+      await ref.set({
+        clientesJson: JSON.stringify(DB.clientes),
+        feriadosJson: JSON.stringify(DB.feriados),
+        updatedAt: now,
+      }, { merge: true });
+    }
+
+    if (podeEditarEntregas()) {
+      const alteradas = DB.entregas.filter(e => (e.updatedAt || 0) > lastCloudPushAt);
+      if (alteradas.length > 0) {
+        const batch = firebase.firestore().batch();
+        alteradas.forEach(e => {
+          batch.set(ref.collection('entregas').doc(e.id), e);
+        });
+        await batch.commit();
+      }
+    }
+
+    lastCloudPushAt = now;
+    localStorage.setItem('picole_last_push_at', String(now));
     localStorage.setItem(LAST_SYNC_KEY, String(now));
     if (typeof renderSyncStatus === 'function') renderSyncStatus();
   } catch (err) {
@@ -151,33 +299,41 @@ async function pushParaNuvem() {
   }
 }
 
+function mesclarEntregasPorId(locais, daNuvem) {
+  const mapa = new Map();
+  locais.forEach(e => mapa.set(e.id, e));
+  daNuvem.forEach(e => {
+    const local = mapa.get(e.id);
+    if (!local || (e.updatedAt || 0) > (local.updatedAt || 0)) {
+      mapa.set(e.id, e);
+    }
+  });
+  return Array.from(mapa.values());
+}
+
 async function sincronizar(silencioso) {
-  // usado ao abrir o app e no botao "Sincronizar agora": compara com a
-  // nuvem e traz dados mais novos de outro aparelho, se houver.
-  if (!SYNC_CONFIG) return;
+  if (!SYNC_CONFIG || !SYNC_CONFIG.syncCode) return;
   if (!silencioso) toast('Sincronizando…');
   try {
     await ensureFirebase();
     const ref = firebase.firestore().collection('sincronizacoes').doc(SYNC_CONFIG.syncCode);
     const snap = await ref.get();
     const cloudData = snap.exists ? snap.data() : null;
-    const localUpdatedAt = DB._updatedAt || 0;
 
-    if (cloudData && cloudData.updatedAt > localUpdatedAt) {
-      // nuvem tem versao mais nova (outro aparelho sincronizou depois) -> traz pra local
-      DB = JSON.parse(cloudData.json);
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(DB));
-      if (typeof refreshAll === 'function') refreshAll();
-      if (!silencioso) toast('Dados atualizados a partir da nuvem.');
-    } else {
-      // local esta em dia ou mais novo -> manda pra nuvem
-      const now = Date.now();
-      DB._updatedAt = now;
-      await ref.set({ json: JSON.stringify(DB), updatedAt: now });
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(DB));
-      if (!silencioso) toast(cloudData ? 'Dados enviados para a nuvem.' : 'Primeira sincronização concluída.');
+    if (cloudData) {
+      if (cloudData.clientesJson) DB.clientes = JSON.parse(cloudData.clientesJson);
+      if (cloudData.feriadosJson) DB.feriados = JSON.parse(cloudData.feriadosJson);
     }
-    localStorage.setItem(LAST_SYNC_KEY, String(Date.now()));
+
+    const entregasSnap = await ref.collection('entregas').get();
+    const daNuvem = entregasSnap.docs.map(d => d.data());
+    DB.entregas = mesclarEntregasPorId(DB.entregas, daNuvem);
+
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(DB));
+    if (typeof refreshAll === 'function') refreshAll();
+
+    await pushParaNuvem();
+    if (!silencioso) toast('Sincronização concluída.');
   } catch (err) {
     console.error('sincronizar falhou', err);
     if (!silencioso) toast('Não foi possível sincronizar. Verifique sua internet.');
@@ -188,6 +344,7 @@ async function sincronizar(silencioso) {
 function sincronizarAgora() {
   sincronizar(false);
 }
+
 
 /* ---------------- Utilidades de data ---------------- */
 function parseDate(s) {
@@ -262,8 +419,12 @@ function addWorkdays(startKey, n, hset) {
    intervalos entre as últimas 5 entregas; fallback para
    média de tempo simples; fallback final: intervalo padrão.
    ========================================================= */
+function entregasAtivas() {
+  return DB.entregas.filter(e => !e.deletado);
+}
+
 function entregasDoCliente(nome) {
-  return DB.entregas
+  return entregasAtivas()
     .filter(e => e.cliente === nome)
     .slice()
     .sort((a, b) => (a.data < b.data ? 1 : a.data > b.data ? -1 : 0)); // desc
@@ -327,7 +488,7 @@ function valorTotalEntrega(e) {
   return q * vu;
 }
 function getPendencias() {
-  return DB.entregas
+  return entregasAtivas()
     .filter(e => !e.dataPagamento && valorTotalEntrega(e) > 0)
     .map(e => ({ id: e.id, cliente: e.cliente, data: e.data, valor: valorTotalEntrega(e) }))
     .sort((a, b) => (a.data < b.data ? -1 : a.data > b.data ? 1 : 0));
@@ -339,10 +500,11 @@ function getTotalPendente() {
 /* ---------------- Resumo mensal ---------------- */
 function getResumoMensal() {
   const clientesAtivos = DB.clientes.slice().sort((a, b) => a.nome.localeCompare(b.nome));
-  if (DB.entregas.length === 0 || clientesAtivos.length === 0) {
+  const entregas = entregasAtivas();
+  if (entregas.length === 0 || clientesAtivos.length === 0) {
     return { meses: [], linhas: [], totais: [] };
   }
-  const datasOrdenadas = DB.entregas.map(e => e.data).sort();
+  const datasOrdenadas = entregas.map(e => e.data).sort();
   let inicio = parseDate(datasOrdenadas[0]);
   inicio = new Date(inicio.getFullYear(), inicio.getMonth(), 1, 12);
   const hoje = new Date();
@@ -365,7 +527,7 @@ function getResumoMensal() {
       const fimMesDate = parseDate(mesKey);
       fimMesDate.setMonth(fimMesDate.getMonth() + 1);
       const fimMes = dateToKey(fimMesDate);
-      return DB.entregas
+      return entregas
         .filter(e => e.cliente === c.nome && e.data >= inicioMes && e.data < fimMes)
         .reduce((s, e) => s + (Number(e.quantidade) || 0), 0);
     });
@@ -407,8 +569,8 @@ function showScreen(name) {
   document.getElementById('topbar-sub').textContent = sub;
 
   document.getElementById('fab-entrega').style.display = name === 'entregas' ? 'flex' : 'none';
-  document.getElementById('fab-cliente').style.display = name === 'clientes' ? 'flex' : 'none';
-  document.getElementById('fab-feriado').style.display = name === 'feriados' ? 'flex' : 'none';
+  document.getElementById('fab-cliente').style.display = (name === 'clientes' && podeGerenciar()) ? 'flex' : 'none';
+  document.getElementById('fab-feriado').style.display = (name === 'feriados' && podeGerenciar()) ? 'flex' : 'none';
 
   renderScreen(name);
 }
@@ -525,7 +687,7 @@ function openClienteDetalhe(clienteId) {
    ========================================================= */
 function renderEntregas() {
   const el = document.getElementById('entregas-list');
-  const lista = DB.entregas.slice().sort((a, b) => (a.data < b.data ? 1 : a.data > b.data ? -1 : 0));
+  const lista = entregasAtivas().slice().sort((a, b) => (a.data < b.data ? 1 : a.data > b.data ? -1 : 0));
   if (lista.length === 0) {
     el.innerHTML = emptyState('🚚', 'Nenhuma entrega registrada', 'Toque no botão + para lançar a primeira entrega.');
     return;
@@ -623,9 +785,9 @@ function saveEntrega(id) {
       return;
     }
     const e = DB.entregas.find(x => x.id === id);
-    Object.assign(e, { cliente, data, quantidade, observacoes, valorUnitario, dataPagamento, obsPagamento });
+    Object.assign(e, { cliente, data, quantidade, observacoes, valorUnitario, dataPagamento, obsPagamento, updatedAt: Date.now() });
   } else {
-    DB.entregas.push({ id: uid('e'), cliente, data, quantidade, observacoes, valorUnitario, dataPagamento, obsPagamento });
+    DB.entregas.push({ id: uid('e'), cliente, data, quantidade, observacoes, valorUnitario, dataPagamento, obsPagamento, updatedAt: Date.now(), deletado: false });
   }
   saveDB();
   closeModal();
@@ -635,7 +797,14 @@ function saveEntrega(id) {
 
 function deleteEntrega(id) {
   if (!confirm('Excluir esta entrega? Essa ação não pode ser desfeita.')) return;
-  DB.entregas = DB.entregas.filter(x => x.id !== id);
+  const e = DB.entregas.find(x => x.id === id);
+  if (e) {
+    // exclusao "suave": mantem o registro marcado como apagado, em vez de
+    // remove-lo de verdade, para que a exclusao tambem se propague na
+    // proxima sincronizacao com outros aparelhos.
+    e.deletado = true;
+    e.updatedAt = Date.now();
+  }
   saveDB();
   closeModal();
   refreshAll();
@@ -701,6 +870,7 @@ function confirmarPagamento(id) {
   if (!data) { toast('Escolha a data do pagamento.'); return; }
   e.dataPagamento = data;
   e.obsPagamento = document.getElementById('f-confirma-obs-pagto').value.trim();
+  e.updatedAt = Date.now();
   saveDB();
   closeModal();
   refreshAll();
@@ -708,7 +878,7 @@ function confirmarPagamento(id) {
 }
 
 function abrirHistoricoPagos() {
-  const pagos = DB.entregas
+  const pagos = entregasAtivas()
     .filter(e => e.dataPagamento)
     .slice()
     .sort((a, b) => (a.dataPagamento < b.dataPagamento ? 1 : a.dataPagamento > b.dataPagamento ? -1 : 0));
@@ -873,6 +1043,7 @@ function renderClientes() {
 }
 
 function openClienteForm(id) {
+  if (!podeGerenciar()) { toast('Só administradores podem editar lojas.'); return; }
   const editando = !!id;
   const c = editando ? DB.clientes.find(x => x.id === id) : null;
   const html = `
@@ -943,7 +1114,7 @@ function saveCliente(id) {
 
 function deleteCliente(id) {
   const c = DB.clientes.find(x => x.id === id);
-  const temEntregas = DB.entregas.some(e => e.cliente === c.nome);
+  const temEntregas = entregasAtivas().some(e => e.cliente === c.nome);
   const msg = temEntregas
     ? 'Essa loja tem entregas registradas. Elas serão mantidas no histórico, mas a loja some dos cadastros. Continuar?'
     : 'Excluir esta loja?';
@@ -1013,6 +1184,7 @@ function renderFeriados() {
 }
 
 function openFeriadoForm(id) {
+  if (!podeGerenciar()) { toast('Só administradores podem editar feriados.'); return; }
   const editando = !!id;
   const f = editando ? DB.feriados.find(x => x.id === id) : null;
   const html = `
@@ -1104,12 +1276,29 @@ function renderSyncStatus() {
   }
   const lastSync = localStorage.getItem(LAST_SYNC_KEY);
   const lastTxt = lastSync ? new Date(Number(lastSync)).toLocaleString('pt-BR') : 'ainda não';
+
+  let loginBloco;
+  if (AUTH_USER) {
+    const papelTxt = MEU_PAPEL === 'admin' ? 'Administrador' : MEU_PAPEL === 'colaborador' ? 'Colaborador' : 'Sem acesso atribuído ainda';
+    loginBloco = `
+      <div class="settings-item">
+        <div><div class="t">${escapeHtml(AUTH_USER.nome)}</div><div class="d">${escapeHtml(AUTH_USER.email)} · ${papelTxt}</div></div>
+      </div>
+      ${!MEU_PAPEL && SYNC_CONFIG.syncCode ? `<button class="btn ghost block" style="margin-bottom:8px;" onclick="registrarComoAdmin()">Vincular esta conta como administradora</button>` : ''}
+      ${MEU_PAPEL === 'admin' ? `<button class="btn ghost block" style="margin-bottom:8px;" onclick="abrirGestaoUsuarios()">👥 Gerenciar usuários</button>` : ''}
+      <button class="btn ghost block" style="margin-bottom:8px;" onclick="logoutGoogle()">Sair da conta Google</button>
+    `;
+  } else {
+    loginBloco = `<button class="btn ghost block" style="margin-bottom:8px;" onclick="loginComGoogle()">Entrar com Google</button>`;
+  }
+
   el.innerHTML = `
     <div class="settings-item">
       <div><div class="t">Sincronização ativa</div><div class="d">Última sincronização: ${lastTxt}</div></div>
     </div>
     <button class="btn ghost block" style="margin:4px 0 8px;" onclick="sincronizarAgora()">🔄 Sincronizar agora</button>
-    <button class="btn ghost block" style="margin-bottom:8px;" onclick="mostrarCodigoGerado('${SYNC_CONFIG.syncCode}')">Ver código de sincronização</button>
+    ${SYNC_CONFIG.syncCode ? `<button class="btn ghost block" style="margin-bottom:8px;" onclick="mostrarCodigoGerado('${SYNC_CONFIG.syncCode}')">Ver código de sincronização</button>` : ''}
+    ${loginBloco}
     <button class="danger-link" onclick="desconectarSync()">Desconectar sincronização deste aparelho</button>
   `;
 }
@@ -1129,9 +1318,16 @@ function abrirConfigSync() {
       <textarea id="f-firebase-config" placeholder="Cole aqui o firebaseConfig" style="min-height:110px;">${atual ? escapeHtml(JSON.stringify(atual.firebaseConfig, null, 2)) : ''}</textarea>
     </div>
     <div class="field">
+      <label>Este aparelho vai...</label>
+      <select id="f-modo-sync" onchange="document.getElementById('campo-sync-code').style.display = this.value==='codigo' ? 'block':'none';">
+        <option value="novo">Criar um código novo (primeiro aparelho)</option>
+        <option value="codigo">Entrar com um código que eu já tenho</option>
+        <option value="google">Ser convidado só por e-mail (Google) — sem código</option>
+      </select>
+    </div>
+    <div class="field" id="campo-sync-code" style="display:none;">
       <label>Código de sincronização</label>
-      <input type="text" id="f-sync-code" value="${atual ? atual.syncCode : ''}" placeholder="Deixe em branco para criar um novo">
-      <div class="hint">Deixe em branco se este for o primeiro aparelho (um código novo é criado). Se já tiver um código de outro aparelho, cole ele aqui.</div>
+      <input type="text" id="f-sync-code" placeholder="Cole o código aqui">
     </div>
     <div class="formbtns">
       <button class="btn ghost block" onclick="closeModal()">Cancelar</button>
@@ -1148,22 +1344,34 @@ function salvarConfigSyncUI() {
     toast('Não consegui entender essa configuração. Confira se colou o bloco certo.');
     return;
   }
-  let code = document.getElementById('f-sync-code').value.trim();
-  const novoCodigo = !code;
-  if (!code) code = gerarCodigoSync();
+  const modo = document.getElementById('f-modo-sync').value;
 
-  SYNC_CONFIG = { firebaseConfig: parsed, syncCode: code };
-  localStorage.setItem(SYNC_CONFIG_KEY, JSON.stringify(SYNC_CONFIG));
-  firebaseReady = null; // forca reinicializar com a config nova
-  closeModal();
-  renderSyncStatus();
-
-  if (novoCodigo) {
+  if (modo === 'codigo') {
+    const code = document.getElementById('f-sync-code').value.trim();
+    if (!code) { toast('Cole o código de sincronização.'); return; }
+    SYNC_CONFIG = { firebaseConfig: parsed, syncCode: code };
+    localStorage.setItem(SYNC_CONFIG_KEY, JSON.stringify(SYNC_CONFIG));
+    firebaseReady = null;
+    closeModal();
+    renderSyncStatus();
+    sincronizar(false);
+  } else if (modo === 'google') {
+    SYNC_CONFIG = { firebaseConfig: parsed, syncCode: null };
+    localStorage.setItem(SYNC_CONFIG_KEY, JSON.stringify(SYNC_CONFIG));
+    firebaseReady = null;
+    closeModal();
+    renderSyncStatus();
+    toast('Configuração salva. Agora toque em "Entrar com Google".');
+  } else {
+    const code = gerarCodigoSync();
+    SYNC_CONFIG = { firebaseConfig: parsed, syncCode: code };
+    localStorage.setItem(SYNC_CONFIG_KEY, JSON.stringify(SYNC_CONFIG));
+    firebaseReady = null;
+    closeModal();
+    renderSyncStatus();
     toast('Sincronização configurada!');
     pushParaNuvem();
     setTimeout(() => mostrarCodigoGerado(code), 300);
-  } else {
-    sincronizar(false);
   }
 }
 
@@ -1173,7 +1381,7 @@ function mostrarCodigoGerado(code) {
       <h2>Seu código de sincronização</h2>
       <button class="close-x" onclick="closeModal()">✕</button>
     </div>
-    <div class="hint" style="margin-bottom:10px;">Guarde este código. Use-o para conectar outros aparelhos aos mesmos dados: em Mais → Sincronização, cole a mesma configuração do Firebase e este código.</div>
+    <div class="hint" style="margin-bottom:10px;">Guarde este código. Use-o para conectar outros aparelhos aos mesmos dados: em Mais → Sincronização, cole a mesma configuração do Firebase e este código. Quem tem o código tem acesso completo — para dar acesso limitado a alguém, use "Gerenciar usuários" com o e-mail da pessoa em vez de compartilhar o código.</div>
     <div class="card" style="text-align:center;">
       <div style="font-size:20px;font-weight:800;letter-spacing:.03em;font-family:monospace;color:var(--teal-900);word-break:break-all;">${code}</div>
     </div>
@@ -1184,11 +1392,102 @@ function mostrarCodigoGerado(code) {
 
 function desconectarSync() {
   if (!confirm('Isso para de sincronizar este aparelho (os dados salvos aqui continuam, só param de se atualizar com a nuvem). Continuar?')) return;
+  if (AUTH_USER) logoutGoogle();
   SYNC_CONFIG = null;
   localStorage.removeItem(SYNC_CONFIG_KEY);
   closeModal();
   renderSyncStatus();
   toast('Sincronização desconectada.');
+}
+
+/* ---------------- gestão de usuários (UI, só admin) ---------------- */
+async function abrirGestaoUsuarios() {
+  openModal(`
+    <div class="modal-header">
+      <h2>Usuários</h2>
+      <button class="close-x" onclick="closeModal()">✕</button>
+    </div>
+    <div class="hint" style="margin-bottom:12px;">Carregando…</div>
+  `);
+  try {
+    const usuarios = await listarUsuarios();
+    const linhas = usuarios.length === 0
+      ? emptyState('👥', 'Ninguém adicionado ainda', 'Use o botão abaixo para convidar alguém pelo e-mail do Google.')
+      : usuarios.map(u => `
+          <div class="card">
+            <div class="card-row">
+              <div>
+                <div class="card-title">${escapeHtml(u.email)}</div>
+                <div class="card-sub">${u.papel === 'admin' ? 'Administrador' : 'Colaborador'}</div>
+              </div>
+              <button class="btn ghost small" onclick="confirmarRemoverUsuario('${escapeHtml(u.email)}')">Remover</button>
+            </div>
+          </div>
+        `).join('');
+
+    document.getElementById('modal-content').innerHTML = `
+      <div class="modal-header">
+        <h2>Usuários</h2>
+        <button class="close-x" onclick="closeModal()">✕</button>
+      </div>
+      <div class="hint" style="margin-bottom:12px;">Administrador vê e edita tudo. Colaborador vê tudo mas só pode lançar/editar entregas e pagamentos — não mexe em lojas, feriados ou usuários.</div>
+      <button class="btn primary block" style="margin-bottom:14px;" onclick="abrirAdicionarUsuario()">+ Convidar por e-mail</button>
+      ${linhas}
+    `;
+  } catch (err) {
+    console.error(err);
+    document.getElementById('modal-content').innerHTML = `
+      <div class="modal-header"><h2>Usuários</h2><button class="close-x" onclick="closeModal()">✕</button></div>
+      <div class="hint">Não foi possível carregar a lista. Verifique sua internet.</div>
+    `;
+  }
+}
+
+function abrirAdicionarUsuario() {
+  const html = `
+    <div class="modal-header">
+      <h2>Convidar usuário</h2>
+      <button class="close-x" onclick="closeModal()">✕</button>
+    </div>
+    <div class="field">
+      <label>E-mail do Google da pessoa</label>
+      <input type="email" id="f-novo-usuario-email" placeholder="pessoa@gmail.com">
+    </div>
+    <div class="field">
+      <label>Nível de acesso</label>
+      <select id="f-novo-usuario-papel">
+        <option value="colaborador">Colaborador — lança entregas e pagamentos</option>
+        <option value="admin">Administrador — acesso total</option>
+      </select>
+    </div>
+    <div class="hint" style="margin-bottom:14px;">A pessoa precisa entrar no app, colar esta mesma configuração do Firebase e tocar em "Entrar com Google" usando esse e-mail. Ela não precisa saber o código de sincronização.</div>
+    <div class="formbtns">
+      <button class="btn ghost block" onclick="abrirGestaoUsuarios()">Voltar</button>
+      <button class="btn primary block" onclick="salvarNovoUsuario()">Convidar</button>
+    </div>
+  `;
+  openModal(html);
+}
+
+async function salvarNovoUsuario() {
+  const email = document.getElementById('f-novo-usuario-email').value.trim().toLowerCase();
+  const papel = document.getElementById('f-novo-usuario-papel').value;
+  if (!email || !email.includes('@')) { toast('Digite um e-mail válido.'); return; }
+  try {
+    await adicionarUsuario(email, papel);
+    toast('Usuário convidado.');
+    abrirGestaoUsuarios();
+  } catch (err) {
+    console.error(err);
+    toast('Não foi possível convidar. Verifique sua internet.');
+  }
+}
+
+function confirmarRemoverUsuario(email) {
+  if (!confirm(`Remover o acesso de ${email}?`)) return;
+  removerUsuarioCloud(email)
+    .then(() => { toast('Usuário removido.'); abrirGestaoUsuarios(); })
+    .catch((err) => { console.error(err); toast('Não foi possível remover.'); });
 }
 
 /* =========================================================
@@ -1286,6 +1585,7 @@ function importarWorkbook(wb) {
         valorUnitario: Number(r['Valor Unitario'] || r['Valor Unitário']) || 0,
         dataPagamento: excelDateToKey(r['Data Pagamento']),
         obsPagamento: String(r['Observações de Pagamento'] || r['Observacoes de Pagamento'] || ''),
+        updatedAt: Date.now(), deletado: false,
       });
       importadas++;
     });
@@ -1325,7 +1625,7 @@ async function exportarPlanilha() {
   }));
   XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(feriadosRows), 'Feriados');
 
-  const entregasRows = DB.entregas.slice().sort((a, b) => a.data.localeCompare(b.data)).map(e => ({
+  const entregasRows = entregasAtivas().slice().sort((a, b) => a.data.localeCompare(b.data)).map(e => ({
     'Data': fmtDateBR(e.data),
     'Cliente': e.cliente,
     'Quantidade': e.quantidade,
@@ -1381,6 +1681,9 @@ async function exportarPlanilha() {
 carregarConfigSync();
 loadDB();
 refreshAll();
-if (SYNC_CONFIG) {
-  sincronizar(true);
+if (SYNC_CONFIG && SYNC_CONFIG.firebaseConfig && SYNC_CONFIG.firebaseConfig.apiKey) {
+  ensureFirebase().catch((err) => console.error('firebase init falhou', err));
+  if (SYNC_CONFIG.syncCode) {
+    sincronizar(true);
+  }
 }
