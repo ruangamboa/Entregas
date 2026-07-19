@@ -10,6 +10,18 @@ const FIREBASE_APP_URL = 'https://www.gstatic.com/firebasejs/12.15.0/firebase-ap
 const FIREBASE_FIRESTORE_URL = 'https://www.gstatic.com/firebasejs/12.15.0/firebase-firestore-compat.js';
 const FIREBASE_AUTH_URL = 'https://www.gstatic.com/firebasejs/12.15.0/firebase-auth-compat.js';
 
+// Configuração padrão do Firebase deste app — já vem pronta, não precisa
+// colar em cada aparelho novo. Pode ser sobrescrita na tela de
+// Sincronização se um dia for preciso trocar de projeto.
+const DEFAULT_FIREBASE_CONFIG = {
+  apiKey: "AIzaSyDoQkfipxKJmpipiMUFS9BPKias-y24w7I",
+  authDomain: "entregas-picoles.firebaseapp.com",
+  projectId: "entregas-picoles",
+  storageBucket: "entregas-picoles.firebasestorage.app",
+  messagingSenderId: "1062049635898",
+  appId: "1:1062049635898:web:dc3a93626d37631a6a1f03",
+};
+
 const FERIADOS_PADRAO = [
   ['2026-01-01', 'Confraternização Universal'],
   ['2026-02-16', 'Carnaval (segunda-feira)'],
@@ -108,7 +120,10 @@ function ensureFirebase() {
                 AUTH_USER = user ? { email: user.email, nome: user.displayName || user.email } : null;
                 atualizarPapelEDataAposLogin();
               });
-              firebase.auth().getRedirectResult().catch((err) => console.error('login redirect falhou', err));
+              firebase.auth().getRedirectResult().catch((err) => {
+                console.error('login redirect falhou', err);
+                toast('Erro no login: ' + (err && err.code ? err.code : 'desconhecido'));
+              });
             }
             resolve();
           } catch (err) {
@@ -129,7 +144,7 @@ function ensureFirebase() {
 
 function parseFirebaseConfigText(text) {
   const get = (key) => {
-    const m = text.match(new RegExp(key + '\\s*:\\s*["\']([^"\']*)["\']'));
+    const m = text.match(new RegExp('["\']?' + key + '["\']?\\s*:\\s*["\']([^"\']*)["\']'));
     return m ? m[1] : '';
   };
   return {
@@ -200,6 +215,7 @@ async function atualizarPapelEDataAposLogin() {
     }
   } catch (err) {
     console.error('falha ao checar papel', err);
+    toast('Erro ao conectar com a nuvem: ' + (err && err.code ? err.code : (err && err.message) || 'desconhecido'));
   }
   renderSyncStatus();
 }
@@ -1305,17 +1321,20 @@ function renderSyncStatus() {
 
 function abrirConfigSync() {
   const atual = SYNC_CONFIG;
+  const configPreFill = atual
+    ? JSON.stringify(atual.firebaseConfig, null, 2)
+    : (DEFAULT_FIREBASE_CONFIG.apiKey ? JSON.stringify(DEFAULT_FIREBASE_CONFIG, null, 2) : '');
   const html = `
     <div class="modal-header">
       <h2>Sincronização na nuvem</h2>
       <button class="close-x" onclick="closeModal()">✕</button>
     </div>
     <div class="hint" style="margin-bottom:14px;">
-      Cole abaixo a configuração do seu projeto Firebase (o bloco com apiKey, projectId etc. que aparece no console do Firebase, em Configurações do projeto → Seus apps).
+      ${configPreFill ? 'Configuração do Firebase já preenchida automaticamente. Só troque se for usar outro projeto.' : 'Cole abaixo a configuração do seu projeto Firebase (o bloco com apiKey, projectId etc. que aparece no console do Firebase, em Configurações do projeto → Seus apps).'}
     </div>
     <div class="field">
       <label>Configuração do Firebase</label>
-      <textarea id="f-firebase-config" placeholder="Cole aqui o firebaseConfig" style="min-height:110px;">${atual ? escapeHtml(JSON.stringify(atual.firebaseConfig, null, 2)) : ''}</textarea>
+      <textarea id="f-firebase-config" placeholder="Cole aqui o firebaseConfig" style="min-height:110px;">${escapeHtml(configPreFill)}</textarea>
     </div>
     <div class="field">
       <label>Este aparelho vai...</label>
