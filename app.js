@@ -213,17 +213,14 @@ async function atualizarPapelEDataAposLogin() {
         .collection('usuarios').doc(AUTH_USER.email).get();
       MEU_PAPEL = doc.exists ? doc.data().papel : null;
     } else {
-      // ainda sem codigo -> procura em quais sincronizacoes esse e-mail foi convidado
-      const q = await firebase.firestore()
-        .collectionGroup('usuarios')
-        .where('email', '==', AUTH_USER.email)
-        .get();
-      if (!q.empty) {
-        const doc = q.docs[0];
-        const codigo = doc.ref.parent.parent.id;
-        SYNC_CONFIG.syncCode = codigo;
+      // ainda sem codigo -> busca direta (sem collectionGroup) num mapa
+      // separado e-mail -> codigo, criado junto quando alguem e convidado
+      const doc = await firebase.firestore().collection('convites').doc(AUTH_USER.email).get();
+      if (doc.exists) {
+        const dados = doc.data();
+        SYNC_CONFIG.syncCode = dados.codigo;
         localStorage.setItem(SYNC_CONFIG_KEY, JSON.stringify(SYNC_CONFIG));
-        MEU_PAPEL = doc.data().papel;
+        MEU_PAPEL = dados.papel;
         toast('Conectado à sincronização do seu convite.');
         await sincronizar(true);
       }
@@ -240,10 +237,13 @@ async function registrarComoAdmin() {
   if (!SYNC_CONFIG || !SYNC_CONFIG.syncCode) { toast('Configure um código de sincronização primeiro.'); return; }
   try {
     await ensureFirebase();
+    const dadosUsuario = { email: AUTH_USER.email, nome: AUTH_USER.nome, papel: 'admin', adicionadoEm: Date.now() };
     await firebase.firestore()
       .collection('sincronizacoes').doc(SYNC_CONFIG.syncCode)
       .collection('usuarios').doc(AUTH_USER.email)
-      .set({ email: AUTH_USER.email, nome: AUTH_USER.nome, papel: 'admin', adicionadoEm: Date.now() });
+      .set(dadosUsuario);
+    await firebase.firestore().collection('convites').doc(AUTH_USER.email)
+      .set({ codigo: SYNC_CONFIG.syncCode, papel: 'admin' });
     MEU_PAPEL = 'admin';
     toast('Sua conta Google agora é administradora deste código.');
     renderSyncStatus();
@@ -269,6 +269,8 @@ async function adicionarUsuario(email, papel) {
     .collection('sincronizacoes').doc(SYNC_CONFIG.syncCode)
     .collection('usuarios').doc(email)
     .set({ email, papel, adicionadoEm: Date.now() });
+  await firebase.firestore().collection('convites').doc(email)
+    .set({ codigo: SYNC_CONFIG.syncCode, papel });
 }
 
 async function removerUsuarioCloud(email) {
@@ -277,6 +279,7 @@ async function removerUsuarioCloud(email) {
     .collection('sincronizacoes').doc(SYNC_CONFIG.syncCode)
     .collection('usuarios').doc(email)
     .delete();
+  await firebase.firestore().collection('convites').doc(email).delete().catch(() => {});
 }
 
 function podeGerenciar() {
