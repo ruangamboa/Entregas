@@ -173,10 +173,25 @@ async function loginComGoogle() {
   try {
     await ensureFirebase();
     const provider = new firebase.auth.GoogleAuthProvider();
-    await firebase.auth().signInWithRedirect(provider);
+    try {
+      await firebase.auth().signInWithPopup(provider);
+      toast('Login feito!');
+      // onAuthStateChanged dispara sozinho e atualiza o papel/dados
+    } catch (popupErr) {
+      const bloqueado = popupErr && ['auth/popup-blocked', 'auth/cancelled-popup-request',
+        'auth/operation-not-supported-in-this-environment'].includes(popupErr.code);
+      if (bloqueado) {
+        toast('Abrindo tela de login…');
+        await firebase.auth().signInWithRedirect(provider);
+      } else if (popupErr && popupErr.code === 'auth/popup-closed-by-user') {
+        // usuario fechou o popup de proposito, nao precisa de mensagem de erro
+      } else {
+        throw popupErr;
+      }
+    }
   } catch (err) {
     console.error(err);
-    toast('Não foi possível iniciar o login com Google.');
+    toast('Erro no login: ' + (err && err.code ? err.code : 'desconhecido'));
   }
 }
 
