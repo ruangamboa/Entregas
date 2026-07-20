@@ -3,17 +3,16 @@
    ========================================================= */
 
 const STORAGE_KEY = 'picole_data_v1';
-const SYNC_CONFIG_KEY = 'picole_sync_config';
 const LAST_SYNC_KEY = 'picole_last_sync';
+const WORKSPACE_ID = 'principal'; // workspace fixo — sem mais codigo de sincronizacao
 const SHEETJS_URL = 'https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js';
 const FIREBASE_APP_URL = 'https://www.gstatic.com/firebasejs/12.15.0/firebase-app-compat.js';
 const FIREBASE_FIRESTORE_URL = 'https://www.gstatic.com/firebasejs/12.15.0/firebase-firestore-compat.js';
 const FIREBASE_AUTH_URL = 'https://www.gstatic.com/firebasejs/12.15.0/firebase-auth-compat.js';
 
-// Configuração padrão do Firebase deste app — já vem pronta, não precisa
-// colar em cada aparelho novo. Pode ser sobrescrita na tela de
-// Sincronização se um dia for preciso trocar de projeto.
-const DEFAULT_FIREBASE_CONFIG = {
+// Configuração do Firebase deste app — ja vem pronta, ninguem precisa colar
+// nada em nenhum aparelho.
+const FIREBASE_CONFIG = {
   apiKey: "AIzaSyDoQkfipxKJmpipiMUFS9BPKias-y24w7I",
   authDomain: "entregas-picoles.firebaseapp.com",
   projectId: "entregas-picoles",
@@ -83,25 +82,23 @@ function saveDB() {
      (permite colaboradores lançarem entregas sem mexer em clientes)
    - usuarios: papel de cada e-mail (admin | colaborador)
    ========================================================= */
-let SYNC_CONFIG = null; // { firebaseConfig: {...}, syncCode: '...'|null }
-let AUTH_USER = null;   // { email, nome } quando logado com Google, ou null
-let MEU_PAPEL = null;   // 'admin' | 'colaborador' | null (calculado apos login)
+/* =========================================================
+   Sincronização na nuvem — Firestore, workspace único
+   - login com Google OU e-mail/senha (Firebase Auth)
+   - sem "codigo de sincronizacao": o acesso e definido so pelo papel
+     atribuido ao e-mail da pessoa em usuarios/{email}
+   - clientes/feriados: um "blob" so, gerenciado pelo admin
+   - entregas: um documento por entrega, mesclados por updatedAt
+   - papeis: admin (tudo) | colaborador (entregas/pagamentos) |
+     convidado (so leitura, nao escreve nada)
+   ========================================================= */
+let AUTH_USER = null;   // { email, nome } quando logado, ou null
+let MEU_PAPEL = null;   // 'admin' | 'colaborador' | 'convidado' | null
 let firebaseReady = null;
 let pushTimer = null;
 let lastCloudPushAt = 0;
 
-function carregarConfigSync() {
-  try {
-    const raw = localStorage.getItem(SYNC_CONFIG_KEY);
-    SYNC_CONFIG = raw ? JSON.parse(raw) : null;
-  } catch (e) {
-    SYNC_CONFIG = null;
-  }
-  lastCloudPushAt = Number(localStorage.getItem('picole_last_push_at') || 0);
-}
-
 function ensureFirebase() {
-  if (!SYNC_CONFIG) return Promise.reject(new Error('Sincronização não configurada'));
   if (firebaseReady) return firebaseReady;
   firebaseReady = new Promise((resolve, reject) => {
     const s1 = document.createElement('script');
@@ -115,7 +112,7 @@ function ensureFirebase() {
         s3.onload = () => {
           try {
             if (!firebase.apps || firebase.apps.length === 0) {
-              firebase.initializeApp(SYNC_CONFIG.firebaseConfig);
+              firebase.initializeApp(FIREBASE_CONFIG);
               firebase.auth().onAuthStateChanged((user) => {
                 AUTH_USER = user ? { email: user.email, nome: user.displayName || user.email } : null;
                 atualizarPapelEDataAposLogin();
@@ -142,41 +139,20 @@ function ensureFirebase() {
   return firebaseReady;
 }
 
-function parseFirebaseConfigText(text) {
-  const get = (key) => {
-    const m = text.match(new RegExp('["\']?' + key + '["\']?\\s*:\\s*["\']([^"\']*)["\']'));
-    return m ? m[1] : '';
-  };
-  return {
-    apiKey: get('apiKey'),
-    authDomain: get('authDomain'),
-    projectId: get('projectId'),
-    storageBucket: get('storageBucket'),
-    messagingSenderId: get('messagingSenderId'),
-    appId: get('appId'),
-  };
+// tenta iniciar a sessao ja salva (se a pessoa tiver logado antes),
+// silenciosamente, assim que o app abre.
+function tentarRetomarLogin() {
+  ensureFirebase().catch((err) => console.error('firebase init falhou', err));
 }
 
-function gerarCodigoSync() {
-  const chars = 'ABCDEFGHJKMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789';
-  let s = '';
-  for (let i = 0; i < 28; i++) s += chars[Math.floor(Math.random() * chars.length)];
-  return s;
-}
-
-/* ---------------- login com Google ---------------- */
+/* ---------------- login ---------------- */
 async function loginComGoogle() {
-  if (!SYNC_CONFIG || !SYNC_CONFIG.firebaseConfig || !SYNC_CONFIG.firebaseConfig.apiKey) {
-    toast('Cole a configuração do Firebase antes de entrar com Google.');
-    return;
-  }
   try {
     await ensureFirebase();
     const provider = new firebase.auth.GoogleAuthProvider();
     try {
       await firebase.auth().signInWithPopup(provider);
       toast('Login feito!');
-      // onAuthStateChanged dispara sozinho e atualiza o papel/dados
     } catch (popupErr) {
       const bloqueado = popupErr && ['auth/popup-blocked', 'auth/cancelled-popup-request',
         'auth/operation-not-supported-in-this-environment'].includes(popupErr.code);
@@ -184,7 +160,7 @@ async function loginComGoogle() {
         toast('Abrindo tela de login…');
         await firebase.auth().signInWithRedirect(provider);
       } else if (popupErr && popupErr.code === 'auth/popup-closed-by-user') {
-        // usuario fechou o popup de proposito, nao precisa de mensagem de erro
+        // fechou de proposito, sem mensagem
       } else {
         throw popupErr;
       }
@@ -195,7 +171,46 @@ async function loginComGoogle() {
   }
 }
 
-function logoutGoogle() {
+async function loginComEmailSenha() {
+  const email = document.getElementById('f-login-email').value.trim();
+  const senha = document.getElementById('f-login-senha').value;
+  if (!email || !senha) { toast('Preencha e-mail e senha.'); return; }
+  try {
+    await ensureFirebase();
+    await firebase.auth().signInWithEmailAndPassword(email, senha);
+    toast('Login feito!');
+  } catch (err) {
+    console.error(err);
+    if (err && err.code === 'auth/user-not-found') {
+      toast('Não existe conta com esse e-mail. Toque em "Criar conta" se você foi convidado.');
+    } else if (err && err.code === 'auth/wrong-password') {
+      toast('Senha incorreta.');
+    } else {
+      toast('Erro no login: ' + (err && err.code ? err.code : 'desconhecido'));
+    }
+  }
+}
+
+async function criarContaEmailSenha() {
+  const email = document.getElementById('f-login-email').value.trim();
+  const senha = document.getElementById('f-login-senha').value;
+  if (!email || !senha) { toast('Preencha e-mail e senha.'); return; }
+  if (senha.length < 6) { toast('A senha precisa ter pelo menos 6 caracteres.'); return; }
+  try {
+    await ensureFirebase();
+    await firebase.auth().createUserWithEmailAndPassword(email, senha);
+    toast('Conta criada! Já entrou automaticamente.');
+  } catch (err) {
+    console.error(err);
+    if (err && err.code === 'auth/email-already-in-use') {
+      toast('Já existe conta com esse e-mail. Use "Entrar".');
+    } else {
+      toast('Erro ao criar conta: ' + (err && err.code ? err.code : 'desconhecido'));
+    }
+  }
+}
+
+function logout() {
   if (!firebaseReady) return;
   ensureFirebase().then(() => firebase.auth().signOut()).catch(() => {});
   AUTH_USER = null;
@@ -206,24 +221,12 @@ function logoutGoogle() {
 async function atualizarPapelEDataAposLogin() {
   if (!AUTH_USER) { MEU_PAPEL = null; renderSyncStatus(); return; }
   try {
-    // se ja estou ligado a um codigo, so confere meu papel nele
-    if (SYNC_CONFIG.syncCode) {
-      const doc = await firebase.firestore()
-        .collection('sincronizacoes').doc(SYNC_CONFIG.syncCode)
-        .collection('usuarios').doc(AUTH_USER.email).get();
-      MEU_PAPEL = doc.exists ? doc.data().papel : null;
-    } else {
-      // ainda sem codigo -> busca direta (sem collectionGroup) num mapa
-      // separado e-mail -> codigo, criado junto quando alguem e convidado
-      const doc = await firebase.firestore().collection('convites').doc(AUTH_USER.email).get();
-      if (doc.exists) {
-        const dados = doc.data();
-        SYNC_CONFIG.syncCode = dados.codigo;
-        localStorage.setItem(SYNC_CONFIG_KEY, JSON.stringify(SYNC_CONFIG));
-        MEU_PAPEL = dados.papel;
-        toast('Conectado à sincronização do seu convite.');
-        await sincronizar(true);
-      }
+    const doc = await firebase.firestore()
+      .collection('sincronizacoes').doc(WORKSPACE_ID)
+      .collection('usuarios').doc(AUTH_USER.email).get();
+    MEU_PAPEL = doc.exists ? doc.data().papel : null;
+    if (MEU_PAPEL) {
+      await sincronizar(true);
     }
   } catch (err) {
     console.error('falha ao checar papel', err);
@@ -232,33 +235,11 @@ async function atualizarPapelEDataAposLogin() {
   renderSyncStatus();
 }
 
-async function registrarComoAdmin() {
-  if (!AUTH_USER) { toast('Entre com Google primeiro.'); return; }
-  if (!SYNC_CONFIG || !SYNC_CONFIG.syncCode) { toast('Configure um código de sincronização primeiro.'); return; }
-  try {
-    await ensureFirebase();
-    const dadosUsuario = { email: AUTH_USER.email, nome: AUTH_USER.nome, papel: 'admin', adicionadoEm: Date.now() };
-    await firebase.firestore()
-      .collection('sincronizacoes').doc(SYNC_CONFIG.syncCode)
-      .collection('usuarios').doc(AUTH_USER.email)
-      .set(dadosUsuario);
-    await firebase.firestore().collection('convites').doc(AUTH_USER.email)
-      .set({ codigo: SYNC_CONFIG.syncCode, papel: 'admin' });
-    MEU_PAPEL = 'admin';
-    toast('Sua conta Google agora é administradora deste código.');
-    renderSyncStatus();
-  } catch (err) {
-    console.error(err);
-    toast('Não foi possível registrar. Verifique as regras do Firestore.');
-  }
-}
-
 /* ---------------- gestão de usuários (só admin) ---------------- */
 async function listarUsuarios() {
-  if (!SYNC_CONFIG || !SYNC_CONFIG.syncCode) return [];
   await ensureFirebase();
   const snap = await firebase.firestore()
-    .collection('sincronizacoes').doc(SYNC_CONFIG.syncCode)
+    .collection('sincronizacoes').doc(WORKSPACE_ID)
     .collection('usuarios').get();
   return snap.docs.map(d => d.data());
 }
@@ -266,44 +247,42 @@ async function listarUsuarios() {
 async function adicionarUsuario(email, papel) {
   await ensureFirebase();
   await firebase.firestore()
-    .collection('sincronizacoes').doc(SYNC_CONFIG.syncCode)
+    .collection('sincronizacoes').doc(WORKSPACE_ID)
     .collection('usuarios').doc(email)
     .set({ email, papel, adicionadoEm: Date.now() });
-  await firebase.firestore().collection('convites').doc(email)
-    .set({ codigo: SYNC_CONFIG.syncCode, papel });
 }
 
 async function removerUsuarioCloud(email) {
   await ensureFirebase();
   await firebase.firestore()
-    .collection('sincronizacoes').doc(SYNC_CONFIG.syncCode)
+    .collection('sincronizacoes').doc(WORKSPACE_ID)
     .collection('usuarios').doc(email)
     .delete();
-  await firebase.firestore().collection('convites').doc(email).delete().catch(() => {});
 }
 
 function podeGerenciar() {
-  // sem login (so pelo codigo) = acesso total, como antes.
-  // com login, so admin tem acesso de gestao (clientes/feriados/usuarios).
+  // sem login = app local, uso livre. Com login, so admin gerencia
+  // lojas/feriados/usuarios.
   return !AUTH_USER || MEU_PAPEL === 'admin';
 }
 function podeEditarEntregas() {
+  // admin e colaborador podem; convidado (so leitura) nao pode.
   return !AUTH_USER || MEU_PAPEL === 'admin' || MEU_PAPEL === 'colaborador';
 }
 
 /* ---------------- push/pull ---------------- */
 function agendarPushNuvem() {
-  if (!SYNC_CONFIG) return;
+  if (!AUTH_USER || !MEU_PAPEL) return;
   clearTimeout(pushTimer);
   pushTimer = setTimeout(() => { pushParaNuvem(); }, 1500);
 }
 
 async function pushParaNuvem() {
-  if (!SYNC_CONFIG || !SYNC_CONFIG.syncCode) return;
+  if (!AUTH_USER || !MEU_PAPEL) return;
   try {
     await ensureFirebase();
     const now = Date.now();
-    const ref = firebase.firestore().collection('sincronizacoes').doc(SYNC_CONFIG.syncCode);
+    const ref = firebase.firestore().collection('sincronizacoes').doc(WORKSPACE_ID);
 
     if (podeGerenciar()) {
       await ref.set({
@@ -346,11 +325,11 @@ function mesclarEntregasPorId(locais, daNuvem) {
 }
 
 async function sincronizar(silencioso) {
-  if (!SYNC_CONFIG || !SYNC_CONFIG.syncCode) return;
+  if (!AUTH_USER || !MEU_PAPEL) return;
   if (!silencioso) toast('Sincronizando…');
   try {
     await ensureFirebase();
-    const ref = firebase.firestore().collection('sincronizacoes').doc(SYNC_CONFIG.syncCode);
+    const ref = firebase.firestore().collection('sincronizacoes').doc(WORKSPACE_ID);
     const snap = await ref.get();
     const cloudData = snap.exists ? snap.data() : null;
 
@@ -379,8 +358,147 @@ function sincronizarAgora() {
   sincronizar(false);
 }
 
+/* ---------------- UI de sincronização ---------------- */
+function renderSyncStatus() {
+  const el = document.getElementById('sync-status-card');
+  if (!el) return;
 
-/* ---------------- Utilidades de data ---------------- */
+  if (!AUTH_USER) {
+    el.innerHTML = `
+      <div class="settings-item">
+        <div><div class="t">Sincronização e backup na nuvem</div><div class="d">Entre para ativar e usar em mais de um aparelho</div></div>
+      </div>
+      <button class="btn primary block" style="margin:8px 0;" onclick="loginComGoogle()">Entrar com Google</button>
+      <div class="hint" style="margin:6px 0 8px;text-align:center;">ou com e-mail e senha</div>
+      <div class="field">
+        <input type="email" id="f-login-email" placeholder="E-mail">
+      </div>
+      <div class="field">
+        <input type="password" id="f-login-senha" placeholder="Senha">
+      </div>
+      <div class="formbtns" style="margin-bottom:4px;">
+        <button class="btn ghost block" onclick="criarContaEmailSenha()">Criar conta</button>
+        <button class="btn ghost block" onclick="loginComEmailSenha()">Entrar</button>
+      </div>
+      <div class="hint">Criar conta só funciona se um administrador já convidou seu e-mail.</div>
+    `;
+    return;
+  }
+
+  const lastSync = localStorage.getItem(LAST_SYNC_KEY);
+  const lastTxt = lastSync ? new Date(Number(lastSync)).toLocaleString('pt-BR') : 'ainda não';
+  const papelTxt = MEU_PAPEL === 'admin' ? 'Administrador' : MEU_PAPEL === 'colaborador' ? 'Colaborador' :
+    MEU_PAPEL === 'convidado' ? 'Convidado (somente leitura)' : 'Sem acesso atribuído ainda';
+
+  el.innerHTML = `
+    <div class="settings-item">
+      <div><div class="t">${escapeHtml(AUTH_USER.nome)}</div><div class="d">${escapeHtml(AUTH_USER.email)} · ${papelTxt}</div></div>
+    </div>
+    ${MEU_PAPEL ? `
+      <div class="settings-item">
+        <div><div class="t">Sincronização ativa</div><div class="d">Última sincronização: ${lastTxt}</div></div>
+      </div>
+      <button class="btn ghost block" style="margin:4px 0 8px;" onclick="sincronizarAgora()">🔄 Sincronizar agora</button>
+      ${MEU_PAPEL === 'admin' ? `<button class="btn ghost block" style="margin-bottom:8px;" onclick="abrirGestaoUsuarios()">👥 Gerenciar usuários</button>` : ''}
+    ` : `
+      <div class="hint" style="margin:8px 0;">Sua conta ainda não tem acesso liberado. Peça para um administrador te convidar pelo e-mail ${escapeHtml(AUTH_USER.email)}.</div>
+    `}
+    <button class="btn ghost block" onclick="logout()">Sair da conta</button>
+  `;
+}
+
+/* ---------------- gestão de usuários (UI, só admin) ---------------- */
+async function abrirGestaoUsuarios() {
+  openModal(`
+    <div class="modal-header">
+      <h2>Usuários</h2>
+      <button class="close-x" onclick="closeModal()">✕</button>
+    </div>
+    <div class="hint" style="margin-bottom:12px;">Carregando…</div>
+  `);
+  try {
+    const usuarios = await listarUsuarios();
+    const nomePapel = (p) => p === 'admin' ? 'Administrador' : p === 'colaborador' ? 'Colaborador' : 'Convidado (somente leitura)';
+    const linhas = usuarios.length === 0
+      ? emptyState('👥', 'Ninguém adicionado ainda', 'Use o botão abaixo para convidar alguém pelo e-mail do Google.')
+      : usuarios.map(u => `
+          <div class="card">
+            <div class="card-row">
+              <div>
+                <div class="card-title">${escapeHtml(u.email)}</div>
+                <div class="card-sub">${nomePapel(u.papel)}</div>
+              </div>
+              <button class="btn ghost small" onclick="confirmarRemoverUsuario('${escapeHtml(u.email)}')">Remover</button>
+            </div>
+          </div>
+        `).join('');
+
+    document.getElementById('modal-content').innerHTML = `
+      <div class="modal-header">
+        <h2>Usuários</h2>
+        <button class="close-x" onclick="closeModal()">✕</button>
+      </div>
+      <div class="hint" style="margin-bottom:12px;">Administrador vê e edita tudo. Colaborador vê tudo e lança/edita entregas e pagamentos. Convidado só enxerga os dados, não altera nada.</div>
+      <button class="btn primary block" style="margin-bottom:14px;" onclick="abrirAdicionarUsuario()">+ Convidar por e-mail</button>
+      ${linhas}
+    `;
+  } catch (err) {
+    console.error(err);
+    document.getElementById('modal-content').innerHTML = `
+      <div class="modal-header"><h2>Usuários</h2><button class="close-x" onclick="closeModal()">✕</button></div>
+      <div class="hint">Não foi possível carregar a lista. Verifique sua internet.</div>
+    `;
+  }
+}
+
+function abrirAdicionarUsuario() {
+  const html = `
+    <div class="modal-header">
+      <h2>Convidar usuário</h2>
+      <button class="close-x" onclick="closeModal()">✕</button>
+    </div>
+    <div class="field">
+      <label>E-mail da pessoa (Google ou o que ela for usar)</label>
+      <input type="email" id="f-novo-usuario-email" placeholder="pessoa@gmail.com">
+    </div>
+    <div class="field">
+      <label>Nível de acesso</label>
+      <select id="f-novo-usuario-papel">
+        <option value="colaborador">Colaborador — lança entregas e pagamentos</option>
+        <option value="convidado">Convidado — só visualiza, não altera nada</option>
+        <option value="admin">Administrador — acesso total</option>
+      </select>
+    </div>
+    <div class="hint" style="margin-bottom:14px;">A pessoa precisa entrar no app com esse e-mail (Google, ou criando uma senha) — não precisa de mais nada.</div>
+    <div class="formbtns">
+      <button class="btn ghost block" onclick="abrirGestaoUsuarios()">Voltar</button>
+      <button class="btn primary block" onclick="salvarNovoUsuario()">Convidar</button>
+    </div>
+  `;
+  openModal(html);
+}
+
+async function salvarNovoUsuario() {
+  const email = document.getElementById('f-novo-usuario-email').value.trim().toLowerCase();
+  const papel = document.getElementById('f-novo-usuario-papel').value;
+  if (!email || !email.includes('@')) { toast('Digite um e-mail válido.'); return; }
+  try {
+    await adicionarUsuario(email, papel);
+    toast('Usuário convidado.');
+    abrirGestaoUsuarios();
+  } catch (err) {
+    console.error(err);
+    toast('Não foi possível convidar. Verifique sua internet.');
+  }
+}
+
+function confirmarRemoverUsuario(email) {
+  if (!confirm(`Remover o acesso de ${email}?`)) return;
+  removerUsuarioCloud(email)
+    .then(() => { toast('Usuário removido.'); abrirGestaoUsuarios(); })
+    .catch((err) => { console.error(err); toast('Não foi possível remover.'); });
+}
+
 function parseDate(s) {
   // 'YYYY-MM-DD' -> Date local (meio-dia, evita problema de fuso na virada do dia)
   if (!s) return null;
@@ -602,7 +720,7 @@ function showScreen(name) {
   document.getElementById('topbar-title').textContent = title;
   document.getElementById('topbar-sub').textContent = sub;
 
-  document.getElementById('fab-entrega').style.display = name === 'entregas' ? 'flex' : 'none';
+  document.getElementById('fab-entrega').style.display = (name === 'entregas' && podeEditarEntregas()) ? 'flex' : 'none';
   document.getElementById('fab-cliente').style.display = (name === 'clientes' && podeGerenciar()) ? 'flex' : 'none';
   document.getElementById('fab-feriado').style.display = (name === 'feriados' && podeGerenciar()) ? 'flex' : 'none';
 
@@ -743,6 +861,7 @@ function renderEntregas() {
 }
 
 function openEntregaForm(id) {
+  if (!podeEditarEntregas()) { toast('Seu acesso é somente leitura.'); return; }
   const editando = !!id;
   const e = editando ? DB.entregas.find(x => x.id === id) : null;
   const ativos = DB.clientes.filter(c => c.ativo !== false);
@@ -873,6 +992,7 @@ function renderPagamentos() {
 }
 
 function abrirConfirmacaoPagamento(entregaId) {
+  if (!podeEditarEntregas()) { toast('Seu acesso é somente leitura.'); return; }
   const e = DB.entregas.find(x => x.id === entregaId);
   if (!e) return;
   const html = `
@@ -1288,7 +1408,12 @@ document.getElementById('modal-backdrop').addEventListener('click', (e) => {
   if (e.target.id === 'modal-backdrop') closeModal();
 });
 
+
 function confirmarLimpeza() {
+  if (AUTH_USER) {
+    toast('Desconecte a sincronização (Sair da conta) antes de apagar os dados deste aparelho.');
+    return;
+  }
   if (!confirm('Isso apaga TODOS os dados salvos neste app (lojas, entregas, feriados). Não pode ser desfeito. Continuar?')) return;
   localStorage.removeItem(STORAGE_KEY);
   loadDB();
@@ -1296,236 +1421,43 @@ function confirmarLimpeza() {
   toast('Dados apagados.');
 }
 
-/* ---------------- UI de sincronização ---------------- */
-function renderSyncStatus() {
-  const el = document.getElementById('sync-status-card');
-  if (!el) return;
-  if (!SYNC_CONFIG) {
-    el.innerHTML = `
-      <div class="settings-item" onclick="abrirConfigSync()" style="cursor:pointer;">
-        <div><div class="t">Sincronização e backup na nuvem</div><div class="d">Desativada — toque para configurar</div></div>
-        <div>›</div>
-      </div>`;
+/* ---------------- localizar/remover entregas duplicadas ---------------- */
+function encontrarEntregasDuplicadas() {
+  const grupos = new Map();
+  entregasAtivas().forEach(e => {
+    const chave = [e.cliente, e.data, e.quantidade, e.valorUnitario || 0, e.dataPagamento || ''].join('|');
+    if (!grupos.has(chave)) grupos.set(chave, []);
+    grupos.get(chave).push(e);
+  });
+  const duplicadas = [];
+  grupos.forEach(lista => {
+    if (lista.length > 1) {
+      lista.sort((a, b) => (a.updatedAt || 0) - (b.updatedAt || 0));
+      duplicadas.push(...lista.slice(1));
+    }
+  });
+  return duplicadas;
+}
+
+function verificarDuplicadas() {
+  const dups = encontrarEntregasDuplicadas();
+  if (dups.length === 0) {
+    toast('Nenhuma entrega duplicada encontrada.');
     return;
   }
-  const lastSync = localStorage.getItem(LAST_SYNC_KEY);
-  const lastTxt = lastSync ? new Date(Number(lastSync)).toLocaleString('pt-BR') : 'ainda não';
-
-  let loginBloco;
-  if (AUTH_USER) {
-    const papelTxt = MEU_PAPEL === 'admin' ? 'Administrador' : MEU_PAPEL === 'colaborador' ? 'Colaborador' : 'Sem acesso atribuído ainda';
-    loginBloco = `
-      <div class="settings-item">
-        <div><div class="t">${escapeHtml(AUTH_USER.nome)}</div><div class="d">${escapeHtml(AUTH_USER.email)} · ${papelTxt}</div></div>
-      </div>
-      ${!MEU_PAPEL && SYNC_CONFIG.syncCode ? `<button class="btn ghost block" style="margin-bottom:8px;" onclick="registrarComoAdmin()">Vincular esta conta como administradora</button>` : ''}
-      ${MEU_PAPEL === 'admin' ? `<button class="btn ghost block" style="margin-bottom:8px;" onclick="abrirGestaoUsuarios()">👥 Gerenciar usuários</button>` : ''}
-      <button class="btn ghost block" style="margin-bottom:8px;" onclick="logoutGoogle()">Sair da conta Google</button>
-    `;
-  } else {
-    loginBloco = `<button class="btn ghost block" style="margin-bottom:8px;" onclick="loginComGoogle()">Entrar com Google</button>`;
-  }
-
-  el.innerHTML = `
-    <div class="settings-item">
-      <div><div class="t">Sincronização ativa</div><div class="d">Última sincronização: ${lastTxt}</div></div>
-    </div>
-    <button class="btn ghost block" style="margin:4px 0 8px;" onclick="sincronizarAgora()">🔄 Sincronizar agora</button>
-    ${SYNC_CONFIG.syncCode ? `<button class="btn ghost block" style="margin-bottom:8px;" onclick="mostrarCodigoGerado('${SYNC_CONFIG.syncCode}')">Ver código de sincronização</button>` : ''}
-    ${loginBloco}
-    <button class="danger-link" onclick="desconectarSync()">Desconectar sincronização deste aparelho</button>
-  `;
+  const resumo = dups.slice(0, 5).map(e => `${e.cliente} · ${fmtDateBR(e.data)} · ${e.quantidade} un.`).join('\n');
+  const msg = `Encontradas ${dups.length} entrega(s) que parecem duplicadas (mesma loja, data, quantidade e valor)` +
+    (dups.length > 5 ? `, incluindo:\n${resumo}\n...` : `:\n${resumo}`) +
+    `\n\nRemover as cópias extras (mantendo uma de cada)?`;
+  if (!confirm(msg)) return;
+  dups.forEach(e => { e.deletado = true; e.updatedAt = Date.now(); });
+  saveDB();
+  refreshAll();
+  toast(`${dups.length} entrega(s) duplicada(s) removida(s).`);
 }
 
-function abrirConfigSync() {
-  const atual = SYNC_CONFIG;
-  const configPreFill = atual
-    ? JSON.stringify(atual.firebaseConfig, null, 2)
-    : (DEFAULT_FIREBASE_CONFIG.apiKey ? JSON.stringify(DEFAULT_FIREBASE_CONFIG, null, 2) : '');
-  const html = `
-    <div class="modal-header">
-      <h2>Sincronização na nuvem</h2>
-      <button class="close-x" onclick="closeModal()">✕</button>
-    </div>
-    <div class="hint" style="margin-bottom:14px;">
-      ${configPreFill ? 'Configuração do Firebase já preenchida automaticamente. Só troque se for usar outro projeto.' : 'Cole abaixo a configuração do seu projeto Firebase (o bloco com apiKey, projectId etc. que aparece no console do Firebase, em Configurações do projeto → Seus apps).'}
-    </div>
-    <div class="field">
-      <label>Configuração do Firebase</label>
-      <textarea id="f-firebase-config" placeholder="Cole aqui o firebaseConfig" style="min-height:110px;">${escapeHtml(configPreFill)}</textarea>
-    </div>
-    <div class="field">
-      <label>Este aparelho vai...</label>
-      <select id="f-modo-sync" onchange="document.getElementById('campo-sync-code').style.display = this.value==='codigo' ? 'block':'none';">
-        <option value="novo">Criar um código novo (primeiro aparelho)</option>
-        <option value="codigo">Entrar com um código que eu já tenho</option>
-        <option value="google">Ser convidado só por e-mail (Google) — sem código</option>
-      </select>
-    </div>
-    <div class="field" id="campo-sync-code" style="display:none;">
-      <label>Código de sincronização</label>
-      <input type="text" id="f-sync-code" placeholder="Cole o código aqui">
-    </div>
-    <div class="formbtns">
-      <button class="btn ghost block" onclick="closeModal()">Cancelar</button>
-      <button class="btn primary block" onclick="salvarConfigSyncUI()">Salvar</button>
-    </div>
-  `;
-  openModal(html);
-}
 
-function salvarConfigSyncUI() {
-  const text = document.getElementById('f-firebase-config').value;
-  const parsed = parseFirebaseConfigText(text);
-  if (!parsed.apiKey || !parsed.projectId) {
-    toast('Não consegui entender essa configuração. Confira se colou o bloco certo.');
-    return;
-  }
-  const modo = document.getElementById('f-modo-sync').value;
 
-  if (modo === 'codigo') {
-    const code = document.getElementById('f-sync-code').value.trim();
-    if (!code) { toast('Cole o código de sincronização.'); return; }
-    SYNC_CONFIG = { firebaseConfig: parsed, syncCode: code };
-    localStorage.setItem(SYNC_CONFIG_KEY, JSON.stringify(SYNC_CONFIG));
-    firebaseReady = null;
-    closeModal();
-    renderSyncStatus();
-    sincronizar(false);
-  } else if (modo === 'google') {
-    SYNC_CONFIG = { firebaseConfig: parsed, syncCode: null };
-    localStorage.setItem(SYNC_CONFIG_KEY, JSON.stringify(SYNC_CONFIG));
-    firebaseReady = null;
-    closeModal();
-    renderSyncStatus();
-    toast('Configuração salva. Agora toque em "Entrar com Google".');
-  } else {
-    const code = gerarCodigoSync();
-    SYNC_CONFIG = { firebaseConfig: parsed, syncCode: code };
-    localStorage.setItem(SYNC_CONFIG_KEY, JSON.stringify(SYNC_CONFIG));
-    firebaseReady = null;
-    closeModal();
-    renderSyncStatus();
-    toast('Sincronização configurada!');
-    pushParaNuvem();
-    setTimeout(() => mostrarCodigoGerado(code), 300);
-  }
-}
-
-function mostrarCodigoGerado(code) {
-  const html = `
-    <div class="modal-header">
-      <h2>Seu código de sincronização</h2>
-      <button class="close-x" onclick="closeModal()">✕</button>
-    </div>
-    <div class="hint" style="margin-bottom:10px;">Guarde este código. Use-o para conectar outros aparelhos aos mesmos dados: em Mais → Sincronização, cole a mesma configuração do Firebase e este código. Quem tem o código tem acesso completo — para dar acesso limitado a alguém, use "Gerenciar usuários" com o e-mail da pessoa em vez de compartilhar o código.</div>
-    <div class="card" style="text-align:center;">
-      <div style="font-size:20px;font-weight:800;letter-spacing:.03em;font-family:monospace;color:var(--teal-900);word-break:break-all;">${code}</div>
-    </div>
-    <button class="btn primary block" style="margin-top:14px;" onclick="closeModal()">Entendi</button>
-  `;
-  openModal(html);
-}
-
-function desconectarSync() {
-  if (!confirm('Isso para de sincronizar este aparelho (os dados salvos aqui continuam, só param de se atualizar com a nuvem). Continuar?')) return;
-  if (AUTH_USER) logoutGoogle();
-  SYNC_CONFIG = null;
-  localStorage.removeItem(SYNC_CONFIG_KEY);
-  closeModal();
-  renderSyncStatus();
-  toast('Sincronização desconectada.');
-}
-
-/* ---------------- gestão de usuários (UI, só admin) ---------------- */
-async function abrirGestaoUsuarios() {
-  openModal(`
-    <div class="modal-header">
-      <h2>Usuários</h2>
-      <button class="close-x" onclick="closeModal()">✕</button>
-    </div>
-    <div class="hint" style="margin-bottom:12px;">Carregando…</div>
-  `);
-  try {
-    const usuarios = await listarUsuarios();
-    const linhas = usuarios.length === 0
-      ? emptyState('👥', 'Ninguém adicionado ainda', 'Use o botão abaixo para convidar alguém pelo e-mail do Google.')
-      : usuarios.map(u => `
-          <div class="card">
-            <div class="card-row">
-              <div>
-                <div class="card-title">${escapeHtml(u.email)}</div>
-                <div class="card-sub">${u.papel === 'admin' ? 'Administrador' : 'Colaborador'}</div>
-              </div>
-              <button class="btn ghost small" onclick="confirmarRemoverUsuario('${escapeHtml(u.email)}')">Remover</button>
-            </div>
-          </div>
-        `).join('');
-
-    document.getElementById('modal-content').innerHTML = `
-      <div class="modal-header">
-        <h2>Usuários</h2>
-        <button class="close-x" onclick="closeModal()">✕</button>
-      </div>
-      <div class="hint" style="margin-bottom:12px;">Administrador vê e edita tudo. Colaborador vê tudo mas só pode lançar/editar entregas e pagamentos — não mexe em lojas, feriados ou usuários.</div>
-      <button class="btn primary block" style="margin-bottom:14px;" onclick="abrirAdicionarUsuario()">+ Convidar por e-mail</button>
-      ${linhas}
-    `;
-  } catch (err) {
-    console.error(err);
-    document.getElementById('modal-content').innerHTML = `
-      <div class="modal-header"><h2>Usuários</h2><button class="close-x" onclick="closeModal()">✕</button></div>
-      <div class="hint">Não foi possível carregar a lista. Verifique sua internet.</div>
-    `;
-  }
-}
-
-function abrirAdicionarUsuario() {
-  const html = `
-    <div class="modal-header">
-      <h2>Convidar usuário</h2>
-      <button class="close-x" onclick="closeModal()">✕</button>
-    </div>
-    <div class="field">
-      <label>E-mail do Google da pessoa</label>
-      <input type="email" id="f-novo-usuario-email" placeholder="pessoa@gmail.com">
-    </div>
-    <div class="field">
-      <label>Nível de acesso</label>
-      <select id="f-novo-usuario-papel">
-        <option value="colaborador">Colaborador — lança entregas e pagamentos</option>
-        <option value="admin">Administrador — acesso total</option>
-      </select>
-    </div>
-    <div class="hint" style="margin-bottom:14px;">A pessoa precisa entrar no app, colar esta mesma configuração do Firebase e tocar em "Entrar com Google" usando esse e-mail. Ela não precisa saber o código de sincronização.</div>
-    <div class="formbtns">
-      <button class="btn ghost block" onclick="abrirGestaoUsuarios()">Voltar</button>
-      <button class="btn primary block" onclick="salvarNovoUsuario()">Convidar</button>
-    </div>
-  `;
-  openModal(html);
-}
-
-async function salvarNovoUsuario() {
-  const email = document.getElementById('f-novo-usuario-email').value.trim().toLowerCase();
-  const papel = document.getElementById('f-novo-usuario-papel').value;
-  if (!email || !email.includes('@')) { toast('Digite um e-mail válido.'); return; }
-  try {
-    await adicionarUsuario(email, papel);
-    toast('Usuário convidado.');
-    abrirGestaoUsuarios();
-  } catch (err) {
-    console.error(err);
-    toast('Não foi possível convidar. Verifique sua internet.');
-  }
-}
-
-function confirmarRemoverUsuario(email) {
-  if (!confirm(`Remover o acesso de ${email}?`)) return;
-  removerUsuarioCloud(email)
-    .then(() => { toast('Usuário removido.'); abrirGestaoUsuarios(); })
-    .catch((err) => { console.error(err); toast('Não foi possível remover.'); });
-}
 
 /* =========================================================
    Importar / Exportar planilha (.xlsx) — via SheetJS (CDN)
@@ -1617,7 +1549,7 @@ function importarWorkbook(wb) {
       const quantidade = Number(r['Quantidade']) || 0;
       if (!dataKey || !cliente || quantidade <= 0) return;
       novo.entregas.push({
-        id: uid('e'), data: dataKey, cliente, quantidade,
+        id: String(r['ID'] || '').trim() || uid('e'), data: dataKey, cliente, quantidade,
         observacoes: String(r['Observações'] || r['Observacoes'] || ''),
         valorUnitario: Number(r['Valor Unitario'] || r['Valor Unitário']) || 0,
         dataPagamento: excelDateToKey(r['Data Pagamento']),
@@ -1663,6 +1595,7 @@ async function exportarPlanilha() {
   XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(feriadosRows), 'Feriados');
 
   const entregasRows = entregasAtivas().slice().sort((a, b) => a.data.localeCompare(b.data)).map(e => ({
+    'ID': e.id,
     'Data': fmtDateBR(e.data),
     'Cliente': e.cliente,
     'Quantidade': e.quantidade,
@@ -1715,12 +1648,6 @@ async function exportarPlanilha() {
 /* =========================================================
    Inicialização
    ========================================================= */
-carregarConfigSync();
 loadDB();
 refreshAll();
-if (SYNC_CONFIG && SYNC_CONFIG.firebaseConfig && SYNC_CONFIG.firebaseConfig.apiKey) {
-  ensureFirebase().catch((err) => console.error('firebase init falhou', err));
-  if (SYNC_CONFIG.syncCode) {
-    sincronizar(true);
-  }
-}
+tentarRetomarLogin();

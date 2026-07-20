@@ -291,14 +291,18 @@ a.link{color:var(--teal-700);font-weight:700;text-decoration:none;}
         <div><div class="t">Exportar planilha (.xlsx)</div><div class="d">Gera um arquivo Excel com os dados atuais</div></div>
         <div>›</div>
       </div>
+      <div class="settings-item" onclick="verificarDuplicadas()" style="cursor:pointer;">
+        <div><div class="t">Verificar entregas duplicadas</div><div class="d">Encontra e remove cópias repetidas da mesma entrega</div></div>
+        <div>›</div>
+      </div>
     </div>
     <input type="file" id="file-import" accept=".xlsx">
 
     <div class="section-title">Sobre</div>
     <div class="card">
       <div style="font-size:13px;color:var(--ink-soft);line-height:1.6;">
-        App pessoal de controle de entregas de picolé. Os dados ficam salvos só neste aparelho/navegador.
-        Importar e exportar planilha exigem internet no momento do uso.
+        App pessoal de controle de entregas de picolé. Sem login, os dados ficam só neste aparelho/navegador.
+        Com login, sincronizam com a nuvem automaticamente. Importar/exportar planilha exigem internet no momento do uso.
       </div>
       <button class="danger-link" onclick="confirmarLimpeza()">Apagar todos os dados deste app</button>
     </div>
