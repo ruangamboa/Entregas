@@ -260,14 +260,33 @@ async function removerUsuarioCloud(email) {
     .delete();
 }
 
-function podeGerenciar() {
-  // sem login = app local, uso livre. Com login, so admin gerencia
-  // lojas/feriados/usuarios.
+// Matriz de permissões (4 papéis: admin, gerente, colaborador, convidado).
+// Sem login = app local, uso livre (equivalente a admin).
+function podeGerenciarUsuarios() {
   return !AUTH_USER || MEU_PAPEL === 'admin';
 }
+function podeImportar() {
+  return !AUTH_USER || MEU_PAPEL === 'admin';
+}
+function podeExportar() {
+  return !AUTH_USER || MEU_PAPEL === 'admin' || MEU_PAPEL === 'gerente';
+}
+function podeGerenciar() {
+  // lojas e feriados: admin e gerente
+  return !AUTH_USER || MEU_PAPEL === 'admin' || MEU_PAPEL === 'gerente';
+}
 function podeEditarEntregas() {
-  // admin e colaborador podem; convidado (so leitura) nao pode.
-  return !AUTH_USER || MEU_PAPEL === 'admin' || MEU_PAPEL === 'colaborador';
+  // admin, gerente e colaborador podem; convidado (so leitura) nao pode.
+  return !AUTH_USER || MEU_PAPEL === 'admin' || MEU_PAPEL === 'gerente' || MEU_PAPEL === 'colaborador';
+}
+function podeConfirmarPagamento() {
+  // colaborador NAO pode confirmar pagamentos, so admin e gerente
+  return !AUTH_USER || MEU_PAPEL === 'admin' || MEU_PAPEL === 'gerente';
+}
+function podeVerResumoEFinanceiro() {
+  // colaborador e convidado nao tem acesso (nem leitura) ao resumo
+  // mensal nem a area financeira
+  return !AUTH_USER || MEU_PAPEL === 'admin' || MEU_PAPEL === 'gerente';
 }
 
 /* ---------------- push/pull ---------------- */
@@ -387,7 +406,8 @@ function renderSyncStatus() {
 
   const lastSync = localStorage.getItem(LAST_SYNC_KEY);
   const lastTxt = lastSync ? new Date(Number(lastSync)).toLocaleString('pt-BR') : 'ainda não';
-  const papelTxt = MEU_PAPEL === 'admin' ? 'Administrador' : MEU_PAPEL === 'colaborador' ? 'Colaborador' :
+  const papelTxt = MEU_PAPEL === 'admin' ? 'Administrador' : MEU_PAPEL === 'gerente' ? 'Gerente' :
+    MEU_PAPEL === 'colaborador' ? 'Colaborador' :
     MEU_PAPEL === 'convidado' ? 'Convidado (somente leitura)' : 'Sem acesso atribuído ainda';
 
   el.innerHTML = `
@@ -418,7 +438,8 @@ async function abrirGestaoUsuarios() {
   `);
   try {
     const usuarios = await listarUsuarios();
-    const nomePapel = (p) => p === 'admin' ? 'Administrador' : p === 'colaborador' ? 'Colaborador' : 'Convidado (somente leitura)';
+    const nomePapel = (p) => p === 'admin' ? 'Administrador' : p === 'gerente' ? 'Gerente' :
+      p === 'colaborador' ? 'Colaborador' : 'Convidado (somente leitura)';
     const linhas = usuarios.length === 0
       ? emptyState('👥', 'Ninguém adicionado ainda', 'Use o botão abaixo para convidar alguém pelo e-mail do Google.')
       : usuarios.map(u => `
@@ -438,7 +459,7 @@ async function abrirGestaoUsuarios() {
         <h2>Usuários</h2>
         <button class="close-x" onclick="closeModal()">✕</button>
       </div>
-      <div class="hint" style="margin-bottom:12px;">Administrador vê e edita tudo. Colaborador vê tudo e lança/edita entregas e pagamentos. Convidado só enxerga os dados, não altera nada.</div>
+      <div class="hint" style="margin-bottom:12px;">Administrador: acesso total. Gerente: tudo igual ao admin, exceto gerenciar usuários e importar planilha. Colaborador: lança/edita entregas, mas não confirma pagamentos nem vê resumo mensal/financeiro. Convidado: só visualiza o que o colaborador vê, sem editar nada.</div>
       <button class="btn primary block" style="margin-bottom:14px;" onclick="abrirAdicionarUsuario()">+ Convidar por e-mail</button>
       ${linhas}
     `;
@@ -464,8 +485,9 @@ function abrirAdicionarUsuario() {
     <div class="field">
       <label>Nível de acesso</label>
       <select id="f-novo-usuario-papel">
-        <option value="colaborador">Colaborador — lança entregas e pagamentos</option>
+        <option value="colaborador">Colaborador — lança/edita entregas</option>
         <option value="convidado">Convidado — só visualiza, não altera nada</option>
+        <option value="gerente">Gerente — tudo do admin, exceto usuários e importar</option>
         <option value="admin">Administrador — acesso total</option>
       </select>
     </div>
@@ -707,6 +729,11 @@ const TITULOS = {
 };
 
 function showScreen(name) {
+  if (name === 'resumo' && !podeVerResumoEFinanceiro()) {
+    toast('Você não tem acesso ao Resumo Mensal.');
+    name = 'mais';
+  }
+
   document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
   document.getElementById('screen-' + name).classList.add('active');
 
@@ -739,6 +766,18 @@ function renderScreen(name) {
 function refreshAll() {
   renderPainel(); renderEntregas(); renderPagamentos();
   renderClientes(); renderResumo(); renderFeriados(); renderSyncStatus();
+  atualizarVisibilidadePermissoes();
+}
+
+function atualizarVisibilidadePermissoes() {
+  const itemResumo = document.getElementById('item-resumo');
+  if (itemResumo) itemResumo.style.display = podeVerResumoEFinanceiro() ? '' : 'none';
+  const itemImportar = document.getElementById('item-importar');
+  if (itemImportar) itemImportar.style.display = podeImportar() ? '' : 'none';
+  const itemExportar = document.getElementById('item-exportar');
+  if (itemExportar) itemExportar.style.display = podeExportar() ? '' : 'none';
+  const itemRestaurar = document.getElementById('item-restaurar-backup');
+  if (itemRestaurar) itemRestaurar.style.display = podeImportar() ? '' : 'none';
 }
 
 /* ---------------- Toast ---------------- */
@@ -986,13 +1025,13 @@ function renderPagamentos() {
           <div class="card-title" style="color:var(--coral-dark);">${fmtMoney(p.valor)}</div>
         </div>
       </div>
-      <button class="btn ghost small" style="margin-top:10px;" onclick="abrirConfirmacaoPagamento('${p.id}')">Marcar como pago</button>
+      ${podeConfirmarPagamento() ? `<button class="btn ghost small" style="margin-top:10px;" onclick="abrirConfirmacaoPagamento('${p.id}')">Marcar como pago</button>` : ''}
     </div>
   `).join('');
 }
 
 function abrirConfirmacaoPagamento(entregaId) {
-  if (!podeEditarEntregas()) { toast('Seu acesso é somente leitura.'); return; }
+  if (!podeConfirmarPagamento()) { toast('Você não tem permissão para confirmar pagamentos.'); return; }
   const e = DB.entregas.find(x => x.id === entregaId);
   if (!e) return;
   const html = `
@@ -1474,8 +1513,55 @@ function ensureSheetJS() {
 }
 
 function triggerImport() {
-  if (!confirm('Importar substitui TODOS os dados atuais deste app pelos dados da planilha. Continuar?')) return;
-  document.getElementById('file-import').click();
+  if (!podeImportar()) { toast('Só administradores podem importar planilha.'); return; }
+  if (!confirm('Importar substitui TODOS os dados atuais deste app pelos dados da planilha. ' +
+    'Antes de continuar, será feito um backup automático (local' +
+    (AUTH_USER ? ' + nuvem' : '') + ') e uma planilha de segurança será baixada. Continuar?')) return;
+  fazerBackupDeSeguranca().then(() => {
+    document.getElementById('file-import').click();
+  });
+}
+
+async function fazerBackupDeSeguranca() {
+  const timestamp = Date.now();
+  const snapshot = { clientes: DB.clientes, feriados: DB.feriados, entregas: DB.entregas, criadoEm: timestamp };
+  try {
+    localStorage.setItem('picole_backup_pre_import', JSON.stringify(snapshot));
+  } catch (e) {
+    console.error('backup local falhou', e);
+  }
+  if (AUTH_USER && MEU_PAPEL) {
+    try {
+      await ensureFirebase();
+      await firebase.firestore()
+        .collection('sincronizacoes').doc(WORKSPACE_ID)
+        .collection('backups').doc(String(timestamp))
+        .set({ json: JSON.stringify(snapshot), criadoEm: timestamp, criadoPor: AUTH_USER.email });
+    } catch (err) {
+      console.error('backup na nuvem falhou', err);
+    }
+  }
+  try {
+    await exportarPlanilha();
+  } catch (err) {
+    console.error('backup em planilha falhou', err);
+  }
+  toast('Backup de segurança concluído. Escolha o arquivo para importar.');
+}
+
+function restaurarBackupLocal() {
+  const raw = localStorage.getItem('picole_backup_pre_import');
+  if (!raw) { toast('Nenhum backup local encontrado neste aparelho.'); return; }
+  let snapshot;
+  try { snapshot = JSON.parse(raw); } catch (e) { toast('Backup corrompido.'); return; }
+  const quando = new Date(snapshot.criadoEm).toLocaleString('pt-BR');
+  if (!confirm(`Restaurar o backup feito em ${quando}? Isso substitui os dados atuais deste aparelho.`)) return;
+  DB.clientes = snapshot.clientes || [];
+  DB.feriados = snapshot.feriados || [];
+  DB.entregas = snapshot.entregas || [];
+  saveDB();
+  refreshAll();
+  toast('Backup restaurado.');
 }
 
 document.getElementById('file-import').addEventListener('change', async (ev) => {
@@ -1568,6 +1654,7 @@ function importarWorkbook(wb) {
 }
 
 async function exportarPlanilha() {
+  if (!podeExportar()) { toast('Você não tem permissão para exportar a planilha.'); return; }
   toast('Preparando planilha…');
   try {
     await ensureSheetJS();

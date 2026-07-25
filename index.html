@@ -268,7 +268,7 @@ a.link{color:var(--teal-700);font-weight:700;text-decoration:none;}
         <div><div class="t">Lojas</div><div class="d">Cadastro de clientes atendidos</div></div>
         <div>›</div>
       </div>
-      <div class="settings-item" onclick="showScreen('resumo')" style="cursor:pointer;">
+      <div class="settings-item" id="item-resumo" onclick="showScreen('resumo')" style="cursor:pointer;">
         <div><div class="t">Resumo mensal</div><div class="d">Quantidade entregue por mês e por loja</div></div>
         <div>›</div>
       </div>
@@ -283,12 +283,16 @@ a.link{color:var(--teal-700);font-weight:700;text-decoration:none;}
 
     <div class="section-title">Dados</div>
     <div class="card" style="padding:4px 16px;">
-      <div class="settings-item" onclick="triggerImport()" style="cursor:pointer;">
+      <div class="settings-item" id="item-importar" onclick="triggerImport()" style="cursor:pointer;">
         <div><div class="t">Importar planilha (.xlsx)</div><div class="d">Traz lojas, feriados e entregas de um arquivo Excel</div></div>
         <div>›</div>
       </div>
-      <div class="settings-item" onclick="exportarPlanilha()" style="cursor:pointer;">
+      <div class="settings-item" id="item-exportar" onclick="exportarPlanilha()" style="cursor:pointer;">
         <div><div class="t">Exportar planilha (.xlsx)</div><div class="d">Gera um arquivo Excel com os dados atuais</div></div>
+        <div>›</div>
+      </div>
+      <div class="settings-item" id="item-restaurar-backup" onclick="restaurarBackupLocal()" style="cursor:pointer;">
+        <div><div class="t">Restaurar backup local</div><div class="d">Volta aos dados de antes da última importação</div></div>
         <div>›</div>
       </div>
       <div class="settings-item" onclick="verificarDuplicadas()" style="cursor:pointer;">
