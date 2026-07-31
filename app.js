@@ -41,6 +41,41 @@ function uid(prefix) {
   return prefix + '_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
 }
 
+/* =========================================================
+   Tipos de cliente / venda
+   - personalizada: fluxo original (já existia antes)
+   - comum: entregas comuns, com pagamento parcelado e vencimento
+   - direta: vendas diretas, fluxo igual ao personalizada
+   ========================================================= */
+const TIPOS_CLIENTE = ['personalizada', 'comum', 'direta'];
+const TIPO_LABEL = {
+  personalizada: 'Entregas Personalizadas',
+  comum: 'Entregas Comuns',
+  direta: 'Vendas Diretas',
+};
+const TIPO_LABEL_CURTO = {
+  personalizada: 'Personalizadas',
+  comum: 'Comuns',
+  direta: 'Diretas',
+};
+let TIPO_ATUAL = localStorage.getItem('picole_tipo_atual') || 'personalizada';
+if (!TIPOS_CLIENTE.includes(TIPO_ATUAL)) TIPO_ATUAL = 'personalizada';
+
+function setTipoAtual(tipo) {
+  if (!TIPOS_CLIENTE.includes(tipo)) return;
+  TIPO_ATUAL = tipo;
+  localStorage.setItem('picole_tipo_atual', tipo);
+  const nomeTela = document.querySelector('.screen.active').id.replace('screen-', '');
+  refreshAll();
+  showScreen(nomeTela);
+}
+
+function tipoSelectorHtml() {
+  return `<div class="pill-select">` + TIPOS_CLIENTE.map(t =>
+    `<button class="${t === TIPO_ATUAL ? 'active' : ''}" onclick="setTipoAtual('${t}')">${TIPO_LABEL_CURTO[t]}</button>`
+  ).join('') + `</div>`;
+}
+
 /* ---------------- Data store ---------------- */
 let DB = null;
 
@@ -52,6 +87,12 @@ function defaultDB() {
   };
 }
 
+function migrarTipos() {
+  // dados antigos (antes dos tipos de cliente) viram "personalizada"
+  DB.clientes.forEach(c => { if (!c.tipo || !TIPOS_CLIENTE.includes(c.tipo)) c.tipo = 'personalizada'; });
+  DB.entregas.forEach(e => { if (!e.tipo || !TIPOS_CLIENTE.includes(e.tipo)) e.tipo = 'personalizada'; });
+}
+
 function loadDB() {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
@@ -61,6 +102,7 @@ function loadDB() {
       if (!DB.clientes) DB.clientes = [];
       if (!DB.feriados) DB.feriados = [];
       if (!DB.entregas) DB.entregas = [];
+      migrarTipos();
       return;
     }
   } catch (e) {
@@ -593,12 +635,16 @@ function addWorkdays(startKey, n, hset) {
    intervalos entre as últimas 5 entregas; fallback para
    média de tempo simples; fallback final: intervalo padrão.
    ========================================================= */
-function entregasAtivas() {
-  return DB.entregas.filter(e => !e.deletado);
+function entregasAtivas(tipo) {
+  return DB.entregas.filter(e => !e.deletado && (tipo === undefined || e.tipo === tipo));
 }
 
-function entregasDoCliente(nome) {
-  return entregasAtivas()
+function clientesDoTipo(tipo) {
+  return DB.clientes.filter(c => tipo === undefined || c.tipo === tipo);
+}
+
+function entregasDoCliente(nome, tipo) {
+  return entregasAtivas(tipo)
     .filter(e => e.cliente === nome)
     .slice()
     .sort((a, b) => (a.data < b.data ? 1 : a.data > b.data ? -1 : 0)); // desc
@@ -606,7 +652,7 @@ function entregasDoCliente(nome) {
 
 function calcPainelCliente(cliente) {
   const hset = holidaySet();
-  const lista = entregasDoCliente(cliente.nome).slice(0, 5);
+  const lista = entregasDoCliente(cliente.nome, cliente.tipo).slice(0, 5);
 
   if (lista.length === 0) {
     return {
@@ -657,24 +703,66 @@ function calcPainelCliente(cliente) {
 
 /* ---------------- Pagamentos pendentes ---------------- */
 function valorTotalEntrega(e) {
+  if (Array.isArray(e.parcelas) && e.parcelas.length > 0) {
+    return e.parcelas.reduce((s, p) => s + (Number(p.valor) || 0), 0);
+  }
   const q = Number(e.quantidade) || 0;
   const vu = Number(e.valorUnitario) || 0;
   return q * vu;
 }
-function getPendencias() {
-  return entregasAtivas()
+function entregaStatusPagamento(e) {
+  // 'pago' | 'parcial' | 'pendente'
+  if (Array.isArray(e.parcelas) && e.parcelas.length > 0) {
+    const pagas = e.parcelas.filter(p => !!p.dataPagamento).length;
+    if (pagas === 0) return 'pendente';
+    if (pagas === e.parcelas.length) return 'pago';
+    return 'parcial';
+  }
+  return e.dataPagamento ? 'pago' : 'pendente';
+}
+function getPendencias(tipo) {
+  return entregasAtivas(tipo)
     .filter(e => !e.dataPagamento && valorTotalEntrega(e) > 0)
     .map(e => ({ id: e.id, cliente: e.cliente, data: e.data, valor: valorTotalEntrega(e) }))
     .sort((a, b) => (a.data < b.data ? -1 : a.data > b.data ? 1 : 0));
 }
-function getTotalPendente() {
-  return getPendencias().reduce((s, p) => s + p.valor, 0);
+function getTotalPendente(tipo) {
+  return getPendencias(tipo).reduce((s, p) => s + p.valor, 0);
+}
+
+/* ---------------- Pagamentos parcelados (Entregas Comuns) ---------------- */
+function getParcelasComuns() {
+  // achata todas as parcelas de entregas do tipo "comum" em linhas individuais
+  const hoje = todayStr();
+  const linhas = [];
+  entregasAtivas('comum').forEach(e => {
+    (e.parcelas || []).forEach(p => {
+      if (p.dataPagamento) return; // só pendentes aqui
+      const vencida = !!p.vencimento && p.vencimento < hoje;
+      linhas.push({
+        entregaId: e.id, parcelaId: p.id, cliente: e.cliente, dataEntrega: e.data,
+        quantidade: e.quantidade, valor: Number(p.valor) || 0, vencimento: p.vencimento,
+        status: vencida ? 'vencida' : 'a_vencer',
+      });
+    });
+  });
+  return linhas;
+}
+function getResumoPagamentosComunsPorCliente() {
+  const linhas = getParcelasComuns();
+  const mapa = new Map();
+  linhas.forEach(l => {
+    if (!mapa.has(l.cliente)) mapa.set(l.cliente, { cliente: l.cliente, vencidas: [], aVencer: [] });
+    const g = mapa.get(l.cliente);
+    if (l.status === 'vencida') g.vencidas.push(l); else g.aVencer.push(l);
+  });
+  return Array.from(mapa.values()).sort((a, b) => a.cliente.localeCompare(b.cliente));
 }
 
 /* ---------------- Resumo mensal ---------------- */
-function getResumoMensal() {
-  const clientesAtivos = DB.clientes.slice().sort((a, b) => a.nome.localeCompare(b.nome));
-  const entregas = entregasAtivas();
+function getResumoMensal(tipo) {
+  const clientesAtivos = clientesDoTipo(tipo).slice().sort((a, b) => a.nome.localeCompare(b.nome));
+  const entregas = entregasAtivas(tipo);
   if (entregas.length === 0 || clientesAtivos.length === 0) {
     return { meses: [], linhas: [], totais: [] };
   }
@@ -744,8 +832,10 @@ function showScreen(name) {
   if (tabEl) tabEl.classList.add('active');
 
   const [title, sub] = TITULOS[name] || [name, ''];
+  const TELAS_COM_TIPO = ['painel', 'entregas', 'pagamentos', 'clientes'];
   document.getElementById('topbar-title').textContent = title;
-  document.getElementById('topbar-sub').textContent = sub;
+  document.getElementById('topbar-sub').textContent = TELAS_COM_TIPO.includes(name)
+    ? TIPO_LABEL[TIPO_ATUAL] : sub;
 
   document.getElementById('fab-entrega').style.display = (name === 'entregas' && podeEditarEntregas()) ? 'flex' : 'none';
   document.getElementById('fab-cliente').style.display = (name === 'clientes' && podeGerenciar()) ? 'flex' : 'none';
@@ -802,9 +892,9 @@ function badgeClass(status) {
 
 function renderPainel() {
   const el = document.getElementById('painel-list');
-  const ativos = DB.clientes.filter(c => c.ativo !== false);
+  const ativos = clientesDoTipo(TIPO_ATUAL).filter(c => c.ativo !== false);
   if (ativos.length === 0) {
-    el.innerHTML = emptyState('🍭', 'Nenhuma loja cadastrada ainda', 'Cadastre suas lojas em Mais → Lojas para começar a ver as previsões aqui.');
+    el.innerHTML = tipoSelectorHtml() + emptyState('🍭', 'Nenhuma loja cadastrada ainda', 'Cadastre suas lojas em Mais → Lojas para começar a ver as previsões aqui.');
     return;
   }
   const linhas = ativos.map(c => ({ c, r: calcPainelCliente(c) }));
@@ -815,7 +905,7 @@ function renderPainel() {
     return a.r.diasAte - b.r.diasAte;
   });
 
-  el.innerHTML = linhas.map(({ c, r }) => {
+  el.innerHTML = tipoSelectorHtml() + linhas.map(({ c, r }) => {
     const proxima = r.proximaEntrega ? fmtDateBR(r.proximaEntrega) : '—';
     const ultima = r.ultimaEntrega ? fmtDateBR(r.ultimaEntrega) : 'sem entregas';
     const diasTxt = r.diasAte === null ? '' :
@@ -841,7 +931,7 @@ function renderPainel() {
 function openClienteDetalhe(clienteId) {
   const cliente = DB.clientes.find(c => c.id === clienteId);
   if (!cliente) return;
-  const lista = entregasDoCliente(cliente.nome); // ja vem ordenada da mais recente pra mais antiga
+  const lista = entregasDoCliente(cliente.nome, cliente.tipo); // ja vem ordenada da mais recente pra mais antiga
 
   const totalQtd = lista.reduce((s, e) => s + (Number(e.quantidade) || 0), 0);
 
@@ -849,7 +939,9 @@ function openClienteDetalhe(clienteId) {
     ? emptyState('🚚', 'Nenhuma entrega registrada', 'Ainda não há entregas lançadas para essa loja.')
     : lista.map(e => {
         const valor = valorTotalEntrega(e);
-        const pago = !!e.dataPagamento;
+        const status = entregaStatusPagamento(e);
+        const badgeCls = status === 'pago' ? 'green' : status === 'parcial' ? 'amber' : 'amber';
+        const badgeTxt = status === 'pago' ? 'Pago' : status === 'parcial' ? 'Parcial' : 'Pendente';
         return `
           <div class="card" onclick="closeModal(); openEntregaForm('${e.id}')" style="cursor:pointer;">
             <div class="card-row">
@@ -857,7 +949,7 @@ function openClienteDetalhe(clienteId) {
                 <div class="card-title">${fmtDateBR(e.data)}</div>
                 <div class="card-sub">${e.quantidade} un.${valor > 0 ? ' · ' + fmtMoney(valor) : ''}</div>
               </div>
-              <span class="badge ${pago ? 'green' : 'amber'}">${pago ? 'Pago' : 'Pendente'}</span>
+              <span class="badge ${badgeCls}">${badgeTxt}</span>
             </div>
           </div>`;
       }).join('');
@@ -878,14 +970,16 @@ function openClienteDetalhe(clienteId) {
    ========================================================= */
 function renderEntregas() {
   const el = document.getElementById('entregas-list');
-  const lista = entregasAtivas().slice().sort((a, b) => (a.data < b.data ? 1 : a.data > b.data ? -1 : 0));
+  const lista = entregasAtivas(TIPO_ATUAL).slice().sort((a, b) => (a.data < b.data ? 1 : a.data > b.data ? -1 : 0));
   if (lista.length === 0) {
-    el.innerHTML = emptyState('🚚', 'Nenhuma entrega registrada', 'Toque no botão + para lançar a primeira entrega.');
+    el.innerHTML = tipoSelectorHtml() + emptyState('🚚', 'Nenhuma entrega registrada', 'Toque no botão + para lançar a primeira entrega.');
     return;
   }
-  el.innerHTML = lista.map(e => {
+  el.innerHTML = tipoSelectorHtml() + lista.map(e => {
     const valorTotal = valorTotalEntrega(e);
-    const pago = !!e.dataPagamento;
+    const status = entregaStatusPagamento(e);
+    const badgeCls = status === 'pago' ? 'green' : 'amber';
+    const badgeTxt = status === 'pago' ? 'Pago' : status === 'parcial' ? 'Parcial' : 'Pendente';
     return `
       <div class="card" onclick="openEntregaForm('${e.id}')" style="cursor:pointer;">
         <div class="card-row">
@@ -893,7 +987,7 @@ function renderEntregas() {
             <div class="card-title">${escapeHtml(e.cliente)}</div>
             <div class="card-sub">${fmtDateBR(e.data)} · ${e.quantidade} un. ${valorTotal > 0 ? '· ' + fmtMoney(valorTotal) : ''}</div>
           </div>
-          <span class="badge ${pago ? 'green' : 'amber'}">${pago ? 'Pago' : 'Pendente'}</span>
+          <span class="badge ${badgeCls}">${badgeTxt}</span>
         </div>
       </div>`;
   }).join('');
@@ -903,13 +997,19 @@ function openEntregaForm(id) {
   if (!podeEditarEntregas()) { toast('Seu acesso é somente leitura.'); return; }
   const editando = !!id;
   const e = editando ? DB.entregas.find(x => x.id === id) : null;
-  const ativos = DB.clientes.filter(c => c.ativo !== false);
+  const tipo = editando ? e.tipo : TIPO_ATUAL;
+  const ativos = clientesDoTipo(tipo).filter(c => c.ativo !== false);
   const options = ativos.map(c =>
     `<option value="${escapeHtml(c.nome)}" ${e && e.cliente === c.nome ? 'selected' : ''}>${escapeHtml(c.nome)}</option>`
   ).join('');
 
   if (ativos.length === 0) {
-    toast('Cadastre uma loja antes de lançar uma entrega.');
+    toast(`Cadastre uma loja em "${TIPO_LABEL[tipo]}" antes de lançar uma entrega.`);
+    return;
+  }
+
+  if (tipo === 'comum') {
+    openEntregaFormComum(e, tipo, options);
     return;
   }
 
@@ -918,6 +1018,7 @@ function openEntregaForm(id) {
       <h2>${editando ? 'Editar entrega' : 'Nova entrega'}</h2>
       <button class="close-x" onclick="closeModal()">✕</button>
     </div>
+    <div class="hint" style="margin-bottom:10px;">${TIPO_LABEL[tipo]}</div>
     <div class="field">
       <label>Loja</label>
       <select id="f-cliente">${options}</select>
@@ -979,7 +1080,149 @@ function saveEntrega(id) {
     const e = DB.entregas.find(x => x.id === id);
     Object.assign(e, { cliente, data, quantidade, observacoes, valorUnitario, dataPagamento, obsPagamento, updatedAt: Date.now() });
   } else {
-    DB.entregas.push({ id: uid('e'), cliente, data, quantidade, observacoes, valorUnitario, dataPagamento, obsPagamento, updatedAt: Date.now(), deletado: false });
+    DB.entregas.push({ id: uid('e'), tipo: TIPO_ATUAL, cliente, data, quantidade, observacoes, valorUnitario, dataPagamento, obsPagamento, updatedAt: Date.now(), deletado: false });
+  }
+  saveDB();
+  closeModal();
+  refreshAll();
+  toast('Entrega salva.');
+}
+
+/* ---------------- Formulário de Entregas Comuns (parcelado) ---------------- */
+function gerarParcelasPadrao(n, valorTotal, dataBase) {
+  n = Math.max(1, Math.round(n) || 1);
+  const valorParcela = Math.round((valorTotal / n) * 100) / 100;
+  const parcelas = [];
+  for (let i = 0; i < n; i++) {
+    parcelas.push({
+      id: uid('p'),
+      valor: i === n - 1 ? Math.round((valorTotal - valorParcela * (n - 1)) * 100) / 100 : valorParcela,
+      vencimento: addDaysStr(dataBase, 30 * (i + 1)),
+      dataPagamento: null,
+    });
+  }
+  return parcelas;
+}
+
+function parcelaRowHtml(p, idx) {
+  return `
+    <div class="card" style="padding:10px 12px;margin-bottom:8px;" data-parcela-row data-parcela-id="${p.id}">
+      <div class="row2">
+        <div class="field" style="margin-bottom:6px;">
+          <label>Parcela ${idx + 1} — valor</label>
+          <input type="number" step="0.01" class="f-parcela-valor" value="${p.valor}">
+        </div>
+        <div class="field" style="margin-bottom:6px;">
+          <label>Vencimento</label>
+          <input type="date" class="f-parcela-vencimento" value="${p.vencimento || ''}">
+        </div>
+      </div>
+      <div class="field" style="margin-bottom:0;">
+        <label>Data do pagamento (em branco = pendente)</label>
+        <input type="date" class="f-parcela-pagamento" value="${p.dataPagamento || ''}">
+      </div>
+    </div>`;
+}
+
+function renderParcelasContainer(parcelas) {
+  document.getElementById('parcelas-container').innerHTML = parcelas.map((p, i) => parcelaRowHtml(p, i)).join('');
+}
+
+function recalcularParcelas() {
+  const valorTotal = Number(document.getElementById('f-valor-total').value) || 0;
+  const n = Number(document.getElementById('f-num-parcelas').value) || 1;
+  const dataBase = document.getElementById('f-data').value || todayStr();
+  renderParcelasContainer(gerarParcelasPadrao(n, valorTotal, dataBase));
+}
+
+function coletarParcelasDoForm() {
+  return Array.from(document.querySelectorAll('[data-parcela-row]')).map(row => ({
+    id: row.dataset.parcelaId,
+    valor: Number(row.querySelector('.f-parcela-valor').value) || 0,
+    vencimento: row.querySelector('.f-parcela-vencimento').value || null,
+    dataPagamento: row.querySelector('.f-parcela-pagamento').value || null,
+  }));
+}
+
+function openEntregaFormComum(e, tipo, options) {
+  const editando = !!e;
+  const parcelasIniciais = editando && Array.isArray(e.parcelas) && e.parcelas.length > 0
+    ? e.parcelas
+    : gerarParcelasPadrao(1, editando ? valorTotalEntrega(e) : 0, editando ? e.data : todayStr());
+
+  const html = `
+    <div class="modal-header">
+      <h2>${editando ? 'Editar entrega' : 'Nova entrega'}</h2>
+      <button class="close-x" onclick="closeModal()">✕</button>
+    </div>
+    <div class="hint" style="margin-bottom:10px;">${TIPO_LABEL[tipo]}</div>
+    <div class="field">
+      <label>Loja</label>
+      <select id="f-cliente">${options}</select>
+    </div>
+    <div class="row2">
+      <div class="field">
+        <label>Data da entrega</label>
+        <input type="date" id="f-data" value="${editando ? e.data : todayStr()}">
+      </div>
+      <div class="field">
+        <label>Quantidade</label>
+        <input type="number" id="f-qtd" inputmode="numeric" value="${editando ? e.quantidade : ''}" placeholder="0">
+      </div>
+    </div>
+    <div class="field">
+      <label>Observações da entrega</label>
+      <textarea id="f-obs" placeholder="Opcional">${editando ? escapeHtml(e.observacoes || '') : ''}</textarea>
+    </div>
+    <div class="section-title" style="margin-top:6px;">Pagamento parcelado</div>
+    <div class="row2">
+      <div class="field">
+        <label>Valor total da entrega</label>
+        <input type="number" id="f-valor-total" step="0.01" value="${editando ? valorTotalEntrega(e) : ''}" placeholder="0,00">
+      </div>
+      <div class="field">
+        <label>Nº de parcelas</label>
+        <input type="number" id="f-num-parcelas" min="1" value="${parcelasIniciais.length}">
+      </div>
+    </div>
+    <button type="button" class="btn ghost block" style="margin-bottom:10px;" onclick="recalcularParcelas()">🔁 Gerar/recalcular parcelas</button>
+    <div class="hint" style="margin-bottom:8px;">Gerar recria as parcelas abaixo (divide o valor e vencimentos a cada 30 dias). Depois de gerar, você pode ajustar valor, vencimento e marcar cada parcela como paga individualmente.</div>
+    <div id="parcelas-container">${parcelasIniciais.map((p, i) => parcelaRowHtml(p, i)).join('')}</div>
+    <div class="formbtns" style="margin-top:10px;">
+      <button class="btn ghost block" onclick="closeModal()">Cancelar</button>
+      <button class="btn primary block" onclick="saveEntregaComum(${editando ? `'${e.id}'` : 'null'})">Salvar</button>
+    </div>
+    ${editando ? `<button class="danger-link" onclick="deleteEntrega('${e.id}')">Excluir esta entrega</button>` : ''}
+  `;
+  openModal(html);
+}
+
+function saveEntregaComum(id) {
+  const cliente = document.getElementById('f-cliente').value;
+  const data = document.getElementById('f-data').value;
+  const quantidade = Number(document.getElementById('f-qtd').value) || 0;
+  const observacoes = document.getElementById('f-obs').value.trim();
+  const parcelas = coletarParcelasDoForm();
+
+  if (!data || !cliente || quantidade <= 0) {
+    toast('Preencha loja, data e uma quantidade maior que zero.');
+    return;
+  }
+  if (parcelas.length === 0) {
+    toast('Gere ao menos uma parcela de pagamento.');
+    return;
+  }
+  if (parcelas.some(p => !p.vencimento)) {
+    toast('Preencha a data de vencimento de todas as parcelas.');
+    return;
+  }
+
+  if (id) {
+    if (!confirm('Salvar as alterações feitas nesta entrega?')) return;
+    const e = DB.entregas.find(x => x.id === id);
+    Object.assign(e, { cliente, data, quantidade, observacoes, parcelas, updatedAt: Date.now() });
+  } else {
+    DB.entregas.push({ id: uid('e'), tipo: 'comum', cliente, data, quantidade, observacoes, parcelas, updatedAt: Date.now(), deletado: false });
   }
   saveDB();
   closeModal();
@@ -1007,14 +1250,27 @@ function deleteEntrega(id) {
    PAGAMENTOS
    ========================================================= */
 function renderPagamentos() {
-  document.getElementById('total-pendente').textContent = fmtMoney(getTotalPendente());
   const el = document.getElementById('pagamentos-list');
-  const pend = getPendencias();
-  if (pend.length === 0) {
-    el.innerHTML = emptyState('✅', 'Nada pendente', 'Todas as entregas com valor lançado já foram pagas.');
+  const kpiWrap = document.getElementById('pagamentos-kpi-wrap');
+
+  if (TIPO_ATUAL === 'comum') {
+    kpiWrap.style.display = 'none';
+    document.getElementById('btn-exportar-imagem').style.display = 'none';
+    document.getElementById('btn-historico-pagos').style.display = '';
+    renderPagamentosComuns(el);
     return;
   }
-  el.innerHTML = pend.map(p => `
+
+  kpiWrap.style.display = '';
+  document.getElementById('btn-exportar-imagem').style.display = '';
+  document.getElementById('btn-historico-pagos').style.display = '';
+  document.getElementById('total-pendente').textContent = fmtMoney(getTotalPendente(TIPO_ATUAL));
+  const pend = getPendencias(TIPO_ATUAL);
+  if (pend.length === 0) {
+    el.innerHTML = tipoSelectorHtml() + emptyState('✅', 'Nada pendente', 'Todas as entregas com valor lançado já foram pagas.');
+    return;
+  }
+  el.innerHTML = tipoSelectorHtml() + pend.map(p => `
     <div class="card">
       <div class="card-row">
         <div>
@@ -1028,6 +1284,120 @@ function renderPagamentos() {
       ${podeConfirmarPagamento() ? `<button class="btn ghost small" style="margin-top:10px;" onclick="abrirConfirmacaoPagamento('${p.id}')">Marcar como pago</button>` : ''}
     </div>
   `).join('');
+}
+
+function renderPagamentosComuns(el) {
+  const grupos = getResumoPagamentosComunsPorCliente();
+  const totalVencidas = grupos.reduce((s, g) => s + g.vencidas.reduce((a, l) => a + l.valor, 0), 0);
+  const totalAVencer = grupos.reduce((s, g) => s + g.aVencer.reduce((a, l) => a + l.valor, 0), 0);
+
+  const kpis = `
+    <div class="row2" style="margin-bottom:14px;">
+      <div class="kpi" style="background:linear-gradient(135deg,#E5502F,#9A3324);">
+        <div class="label">Vencidas</div>
+        <div class="value">${fmtMoney(totalVencidas)}</div>
+      </div>
+      <div class="kpi">
+        <div class="label">A vencer</div>
+        <div class="value">${fmtMoney(totalAVencer)}</div>
+      </div>
+    </div>`;
+
+  if (grupos.length === 0) {
+    el.innerHTML = tipoSelectorHtml() + emptyState('✅', 'Nada pendente', 'Todas as parcelas já foram pagas.');
+    return;
+  }
+
+  el.innerHTML = tipoSelectorHtml() + kpis + grupos.map(g => {
+    const totalCliente = [...g.vencidas, ...g.aVencer].reduce((s, l) => s + l.valor, 0);
+    return `
+      <div class="card" onclick="abrirDetalhePagamentosComuns('${escapeHtml(g.cliente)}')" style="cursor:pointer;">
+        <div class="card-row">
+          <div>
+            <div class="card-title">${escapeHtml(g.cliente)}</div>
+            <div class="card-sub">
+              ${g.vencidas.length > 0 ? `<span style="color:var(--red-ink);font-weight:700;">${g.vencidas.length} vencida${g.vencidas.length > 1 ? 's' : ''}</span>` : ''}
+              ${g.vencidas.length > 0 && g.aVencer.length > 0 ? ' · ' : ''}
+              ${g.aVencer.length > 0 ? `${g.aVencer.length} a vencer` : ''}
+            </div>
+          </div>
+          <div class="card-title">${fmtMoney(totalCliente)}</div>
+        </div>
+      </div>`;
+  }).join('');
+}
+
+function abrirDetalhePagamentosComuns(clienteNome) {
+  const grupos = getResumoPagamentosComunsPorCliente();
+  const g = grupos.find(x => x.cliente === clienteNome);
+  if (!g) return;
+  const linha = (l) => `
+    <div class="card">
+      <div class="card-row">
+        <div>
+          <div class="card-title">${fmtDateBR(l.dataEntrega)}</div>
+          <div class="card-sub">${l.quantidade} un. · vencimento ${fmtDateBR(l.vencimento)}</div>
+        </div>
+        <div style="text-align:right;">
+          <div class="card-title" style="color:${l.status === 'vencida' ? 'var(--red-ink)' : 'var(--ink)'};">${fmtMoney(l.valor)}</div>
+          <span class="badge ${l.status === 'vencida' ? 'red' : 'amber'}">${l.status === 'vencida' ? 'Vencida' : 'A vencer'}</span>
+        </div>
+      </div>
+      ${podeConfirmarPagamento() ? `<button class="btn ghost small" style="margin-top:10px;" onclick="abrirConfirmacaoPagamentoParcela('${l.entregaId}','${l.parcelaId}')">Marcar parcela como paga</button>` : ''}
+    </div>`;
+
+  const html = `
+    <div class="modal-header">
+      <h2>${escapeHtml(clienteNome)}</h2>
+      <button class="close-x" onclick="closeModal()">✕</button>
+    </div>
+    ${g.vencidas.length > 0 ? `
+      <button class="btn primary block" style="margin-bottom:10px;" onclick="exportarPagamentosComunsImagem('${escapeHtml(clienteNome)}', true)">📤 Exportar imagem só das vencidas</button>
+    ` : ''}
+    <button class="btn ghost block" style="margin-bottom:14px;" onclick="exportarPagamentosComunsImagem('${escapeHtml(clienteNome)}', false)">📤 Exportar imagem de todas as pendentes</button>
+    ${g.vencidas.length > 0 ? `<div class="section-title">Vencidas</div>${g.vencidas.map(linha).join('')}` : ''}
+    ${g.aVencer.length > 0 ? `<div class="section-title">A vencer</div>${g.aVencer.map(linha).join('')}` : ''}
+  `;
+  openModal(html);
+}
+
+function abrirConfirmacaoPagamentoParcela(entregaId, parcelaId) {
+  if (!podeConfirmarPagamento()) { toast('Você não tem permissão para confirmar pagamentos.'); return; }
+  const e = DB.entregas.find(x => x.id === entregaId);
+  if (!e) return;
+  const p = (e.parcelas || []).find(x => x.id === parcelaId);
+  if (!p) return;
+  const html = `
+    <div class="modal-header">
+      <h2>Confirmar pagamento</h2>
+      <button class="close-x" onclick="closeModal()">✕</button>
+    </div>
+    <div class="hint" style="margin-bottom:14px;">${escapeHtml(e.cliente)} · Entrega de ${fmtDateBR(e.data)} · ${fmtMoney(p.valor)}</div>
+    <div class="field">
+      <label>Data do pagamento</label>
+      <input type="date" id="f-confirma-data-pagto" value="${todayStr()}">
+    </div>
+    <div class="formbtns">
+      <button class="btn ghost block" onclick="closeModal()">Cancelar</button>
+      <button class="btn primary block" onclick="confirmarPagamentoParcela('${entregaId}','${parcelaId}')">Confirmar pagamento</button>
+    </div>
+  `;
+  openModal(html);
+}
+
+function confirmarPagamentoParcela(entregaId, parcelaId) {
+  const e = DB.entregas.find(x => x.id === entregaId);
+  if (!e) return;
+  const p = (e.parcelas || []).find(x => x.id === parcelaId);
+  if (!p) return;
+  const data = document.getElementById('f-confirma-data-pagto').value;
+  if (!data) { toast('Escolha a data do pagamento.'); return; }
+  p.dataPagamento = data;
+  e.updatedAt = Date.now();
+  saveDB();
+  closeModal();
+  refreshAll();
+  toast('Pagamento da parcela confirmado.');
 }
 
 function abrirConfirmacaoPagamento(entregaId) {
@@ -1071,24 +1441,28 @@ function confirmarPagamento(id) {
 }
 
 function abrirHistoricoPagos() {
-  const pagos = entregasAtivas()
-    .filter(e => e.dataPagamento)
+  const pagos = entregasAtivas(TIPO_ATUAL)
+    .filter(e => entregaStatusPagamento(e) === 'pago')
     .slice()
-    .sort((a, b) => (a.dataPagamento < b.dataPagamento ? 1 : a.dataPagamento > b.dataPagamento ? -1 : 0));
+    .sort((a, b) => (a.data < b.data ? 1 : a.data > b.data ? -1 : 0));
 
   const linhasHtml = pagos.length === 0
     ? emptyState('🧾', 'Nenhum pagamento registrado', 'Assim que marcar uma entrega como paga, ela aparece aqui.')
-    : pagos.map(e => `
+    : pagos.map(e => {
+        const dataPag = Array.isArray(e.parcelas) && e.parcelas.length > 0
+          ? e.parcelas.map(p => p.dataPagamento).filter(Boolean).sort().slice(-1)[0]
+          : e.dataPagamento;
+        return `
         <div class="card" onclick="closeModal(); openEntregaForm('${e.id}')" style="cursor:pointer;">
           <div class="card-row">
             <div>
               <div class="card-title">${escapeHtml(e.cliente)}</div>
-              <div class="card-sub">Entrega de ${fmtDateBR(e.data)} · Pago em ${fmtDateBR(e.dataPagamento)}</div>
+              <div class="card-sub">Entrega de ${fmtDateBR(e.data)}${dataPag ? ' · Pago em ' + fmtDateBR(dataPag) : ''}</div>
             </div>
             <div class="card-title" style="color:var(--teal-700);">${fmtMoney(valorTotalEntrega(e))}</div>
           </div>
-        </div>
-      `).join('');
+        </div>`;
+      }).join('');
 
   const html = `
     <div class="modal-header">
@@ -1103,7 +1477,7 @@ function abrirHistoricoPagos() {
 
 /* ---------------- Exportar pendências como imagem ---------------- */
 async function exportarPagamentosImagem() {
-  const pend = getPendencias();
+  const pend = getPendencias(TIPO_ATUAL);
   if (pend.length === 0) {
     toast('Nada pendente para exportar.');
     return;
@@ -1148,7 +1522,7 @@ async function exportarPagamentosImagem() {
   ctx.fillText('TOTAL PENDENTE', PAD, 106);
   ctx.globalAlpha = 1;
   ctx.font = '800 32px Roboto, Arial, sans-serif';
-  ctx.fillText(fmtMoney(getTotalPendente()), PAD, 138);
+  ctx.fillText(fmtMoney(getTotalPendente(TIPO_ATUAL)), PAD, 138);
 
   // linhas
   let y = HEADER_H;
@@ -1212,17 +1586,141 @@ async function exportarPagamentosImagem() {
   }, 'image/png');
 }
 
+/* ---------------- Exportar pendências de Entregas Comuns como imagem (por cliente) ---------------- */
+async function exportarPagamentosComunsImagem(clienteNome, apenasVencidas) {
+  const grupos = getResumoPagamentosComunsPorCliente();
+  const g = grupos.find(x => x.cliente === clienteNome);
+  if (!g) { toast('Nada pendente para exportar.'); return; }
+  const linhas = apenasVencidas ? g.vencidas : [...g.vencidas, ...g.aVencer];
+  if (linhas.length === 0) {
+    toast('Nada para exportar nessa opção.');
+    return;
+  }
+  linhas.sort((a, b) => (a.vencimento < b.vencimento ? -1 : a.vencimento > b.vencimento ? 1 : 0));
+
+  const titulo = apenasVencidas ? 'Parcelas vencidas' : 'Parcelas pendentes (vencidas e a vencer)';
+  const total = linhas.reduce((s, l) => s + l.valor, 0);
+
+  const WIDTH = 800;
+  const PAD = 32;
+  const ROW_H = 74;
+  const HEADER_H = 172;
+  const FOOTER_H = 46;
+  const height = HEADER_H + linhas.length * ROW_H + FOOTER_H;
+
+  const scale = 2;
+  const canvas = document.createElement('canvas');
+  canvas.width = WIDTH * scale;
+  canvas.height = height * scale;
+  const ctx = canvas.getContext('2d');
+  ctx.scale(scale, scale);
+
+  ctx.fillStyle = '#FAFAF8';
+  ctx.fillRect(0, 0, WIDTH, height);
+
+  const grad = ctx.createLinearGradient(0, 0, WIDTH, 0);
+  grad.addColorStop(0, '#0E7C7B');
+  grad.addColorStop(1, '#0A4F4E');
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, WIDTH, HEADER_H);
+
+  ctx.fillStyle = '#FFFFFF';
+  ctx.font = '700 22px Roboto, Arial, sans-serif';
+  ctx.fillText(escapeHtml(clienteNome), PAD, 40);
+
+  ctx.font = '600 15px Roboto, Arial, sans-serif';
+  ctx.globalAlpha = 0.9;
+  ctx.fillText(titulo, PAD, 64);
+  ctx.globalAlpha = 1;
+
+  ctx.font = '400 13px Roboto, Arial, sans-serif';
+  ctx.globalAlpha = 0.85;
+  ctx.fillText(`Gerado em ${new Date().toLocaleDateString('pt-BR')} · Entregas Comuns`, PAD, 84);
+  ctx.globalAlpha = 1;
+
+  ctx.font = '400 13px Roboto, Arial, sans-serif';
+  ctx.globalAlpha = 0.8;
+  ctx.fillText('TOTAL', PAD, 120);
+  ctx.globalAlpha = 1;
+  ctx.font = '800 32px Roboto, Arial, sans-serif';
+  ctx.fillText(fmtMoney(total), PAD, 152);
+
+  let y = HEADER_H;
+  linhas.forEach((l, i) => {
+    if (i % 2 === 1) {
+      ctx.fillStyle = '#F0F4F4';
+      ctx.fillRect(0, y, WIDTH, ROW_H);
+    }
+    ctx.fillStyle = '#1F2933';
+    ctx.font = '700 18px Roboto, Arial, sans-serif';
+    ctx.fillText(`Entrega ${fmtDateBR(l.dataEntrega)} · ${l.quantidade} un.`, PAD, y + 26);
+
+    ctx.fillStyle = '#5C6B73';
+    ctx.font = '400 13.5px Roboto, Arial, sans-serif';
+    ctx.fillText(`Vencimento: ${fmtDateBR(l.vencimento)}`, PAD, y + 46);
+
+    const statusTxt = l.status === 'vencida' ? 'VENCIDA' : 'A VENCER';
+    ctx.fillStyle = l.status === 'vencida' ? '#E5502F' : '#8A6210';
+    ctx.font = '700 12px Roboto, Arial, sans-serif';
+    ctx.fillText(statusTxt, PAD, y + 64);
+
+    ctx.fillStyle = l.status === 'vencida' ? '#E5502F' : '#1F2933';
+    ctx.font = '700 20px Roboto, Arial, sans-serif';
+    const valorTxt = fmtMoney(l.valor);
+    const w = ctx.measureText(valorTxt).width;
+    ctx.fillText(valorTxt, WIDTH - PAD - w, y + 40);
+
+    ctx.strokeStyle = '#E7ECEC';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(PAD, y + ROW_H - 1);
+    ctx.lineTo(WIDTH - PAD, y + ROW_H - 1);
+    ctx.stroke();
+
+    y += ROW_H;
+  });
+
+  ctx.fillStyle = '#5C6B73';
+  ctx.font = '400 12.5px Roboto, Arial, sans-serif';
+  ctx.fillText(`${linhas.length} parcela${linhas.length > 1 ? 's' : ''}`, PAD, y + 28);
+
+  canvas.toBlob(async (blob) => {
+    if (!blob) { toast('Não foi possível gerar a imagem.'); return; }
+    const sufixo = apenasVencidas ? 'Vencidas' : 'Pendentes';
+    const nomeArquivo = `Pagamentos_${sufixo}_${clienteNome.replace(/[^\w]+/g, '_')}_${todayStr()}.png`;
+    const file = new File([blob], nomeArquivo, { type: 'image/png' });
+
+    if (navigator.canShare && navigator.canShare({ files: [file] })) {
+      try {
+        await navigator.share({ files: [file], title: titulo });
+        return;
+      } catch (err) {
+        if (err && err.name === 'AbortError') return;
+      }
+    }
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = nomeArquivo;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1500);
+    toast('Imagem salva.');
+  }, 'image/png');
+}
+
 /* =========================================================
    CLIENTES (Lojas)
    ========================================================= */
 function renderClientes() {
   const el = document.getElementById('clientes-list');
-  const lista = DB.clientes.slice().sort((a, b) => a.nome.localeCompare(b.nome));
+  const lista = clientesDoTipo(TIPO_ATUAL).slice().sort((a, b) => a.nome.localeCompare(b.nome));
   if (lista.length === 0) {
-    el.innerHTML = emptyState('🏬', 'Nenhuma loja cadastrada', 'Toque no botão + para cadastrar a primeira loja.');
+    el.innerHTML = tipoSelectorHtml() + emptyState('🏬', 'Nenhuma loja cadastrada', 'Toque no botão + para cadastrar a primeira loja.');
     return;
   }
-  el.innerHTML = lista.map(c => `
+  el.innerHTML = tipoSelectorHtml() + lista.map(c => `
     <div class="card" onclick="openClienteForm('${c.id}')" style="cursor:pointer;">
       <div class="card-row">
         <div>
@@ -1239,11 +1737,13 @@ function openClienteForm(id) {
   if (!podeGerenciar()) { toast('Só administradores podem editar lojas.'); return; }
   const editando = !!id;
   const c = editando ? DB.clientes.find(x => x.id === id) : null;
+  const tipo = editando ? c.tipo : TIPO_ATUAL;
   const html = `
     <div class="modal-header">
       <h2>${editando ? 'Editar loja' : 'Nova loja'}</h2>
       <button class="close-x" onclick="closeModal()">✕</button>
     </div>
+    <div class="hint" style="margin-bottom:10px;">${TIPO_LABEL[tipo]}</div>
     <div class="field">
       <label>Nome da loja</label>
       <input type="text" id="f-nome" value="${c ? escapeHtml(c.nome) : ''}" placeholder="Ex: Padaria do Zé">
@@ -1286,18 +1786,19 @@ function saveCliente(id) {
 
   if (!nome) { toast('Digite o nome da loja.'); return; }
 
-  const nomeDuplicado = DB.clientes.some(c => c.nome === nome && c.id !== id);
-  if (nomeDuplicado) { toast('Já existe uma loja com esse nome.'); return; }
+  const tipo = id ? DB.clientes.find(x => x.id === id).tipo : TIPO_ATUAL;
+  const nomeDuplicado = DB.clientes.some(c => c.nome === nome && c.tipo === tipo && c.id !== id);
+  if (nomeDuplicado) { toast('Já existe uma loja com esse nome nesse tipo.'); return; }
 
   if (id) {
     const antigo = DB.clientes.find(x => x.id === id);
     const nomeAntigo = antigo.nome;
     Object.assign(antigo, { nome, endereco, contato, intervaloPadrao, ativo });
     if (nomeAntigo !== nome) {
-      DB.entregas.forEach(e => { if (e.cliente === nomeAntigo) e.cliente = nome; });
+      DB.entregas.forEach(e => { if (e.cliente === nomeAntigo && e.tipo === tipo) e.cliente = nome; });
     }
   } else {
-    DB.clientes.push({ id: uid('c'), nome, endereco, contato, intervaloPadrao, ativo });
+    DB.clientes.push({ id: uid('c'), tipo, nome, endereco, contato, intervaloPadrao, ativo });
   }
   saveDB();
   closeModal();
@@ -1307,7 +1808,7 @@ function saveCliente(id) {
 
 function deleteCliente(id) {
   const c = DB.clientes.find(x => x.id === id);
-  const temEntregas = entregasAtivas().some(e => e.cliente === c.nome);
+  const temEntregas = entregasAtivas(c.tipo).some(e => e.cliente === c.nome);
   const msg = temEntregas
     ? 'Essa loja tem entregas registradas. Elas serão mantidas no histórico, mas a loja some dos cadastros. Continuar?'
     : 'Excluir esta loja?';
@@ -1324,9 +1825,9 @@ function deleteCliente(id) {
    ========================================================= */
 function renderResumo() {
   const el = document.getElementById('resumo-container');
-  const { meses, linhas, totais, totalGeral } = getResumoMensal();
+  const { meses, linhas, totais, totalGeral } = getResumoMensal(TIPO_ATUAL);
   if (meses.length === 0) {
-    el.innerHTML = emptyState('📊', 'Sem dados ainda', 'Assim que houver entregas registradas, o resumo mensal aparece aqui.');
+    el.innerHTML = tipoSelectorHtml() + emptyState('📊', 'Sem dados ainda', 'Assim que houver entregas registradas, o resumo mensal aparece aqui.');
     return;
   }
   const headCols = meses.map(m => `<th>${fmtMesAno(m)}</th>`).join('');
@@ -1344,7 +1845,7 @@ function renderResumo() {
       <td>${totalGeral}</td>
     </tr>
   `;
-  el.innerHTML = `
+  el.innerHTML = tipoSelectorHtml() + `
     <div class="table-wrap">
       <table class="resumo">
         <thead><tr><th>Loja</th>${headCols}<th>Total</th></tr></thead>
