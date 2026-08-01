@@ -2,7 +2,7 @@
 // primeiro; so usa o cache guardado quando estiver realmente offline.
 // (a v1 fazia cache-first e ficava presa em versoes antigas do app.js
 // depois de cada atualizacao — corrigido aqui.)
-const CACHE = 'picole-shell-v2';
+const CACHE = 'picole-shell-v3';
 const SHELL = ['./index.html', './app.js', './manifest.json', './icon-192.png', './icon-512.png'];
 
 self.addEventListener('install', (event) => {
