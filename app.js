@@ -894,6 +894,8 @@ function atualizarVisibilidadePermissoes() {
   if (itemExportar) itemExportar.style.display = podeExportar() ? '' : 'none';
   const itemRestaurar = document.getElementById('item-restaurar-backup');
   if (itemRestaurar) itemRestaurar.style.display = podeImportar() ? '' : 'none';
+  const itemDesfazer = document.getElementById('item-desfazer-restauracao');
+  if (itemDesfazer) itemDesfazer.style.display = podeImportar() ? '' : 'none';
 }
 
 /* ---------------- Toast ---------------- */
@@ -2237,8 +2239,73 @@ function restaurarBackupLocal() {
   if (!raw) { toast('Nenhum backup local encontrado neste aparelho.'); return; }
   let snapshot;
   try { snapshot = JSON.parse(raw); } catch (e) { toast('Backup corrompido.'); return; }
+
   const quando = new Date(snapshot.criadoEm).toLocaleString('pt-BR');
-  if (!confirm(`Restaurar o backup feito em ${quando}? Isso substitui os dados atuais deste aparelho.`)) return;
+  const idsNoBackup = new Set((snapshot.entregas || []).map(e => e.id));
+  const entregasAfetadas = DB.entregas.filter(e =>
+    !idsNoBackup.has(e.id) || (e.updatedAt || 0) > (snapshot.criadoEm || 0)
+  ).length;
+  const clientesAfetados = Math.max(0, DB.clientes.length - (snapshot.clientes || []).length);
+
+  const html = `
+    <div class="modal-header">
+      <h2>Restaurar backup local</h2>
+      <button class="close-x" onclick="closeModal()">✕</button>
+    </div>
+    <div class="hint" style="margin-bottom:10px;">Backup feito em ${quando}.</div>
+    ${entregasAfetadas > 0 ? `
+      <div class="card" style="background:#FDEDEA;border:1px solid #F1B3A6;margin-bottom:12px;">
+        <strong style="color:var(--red-ink);">Atenção: isso vai apagar ou reverter ${entregasAfetadas} entrega${entregasAfetadas > 1 ? 's' : ''} lançada${entregasAfetadas > 1 ? 's' : ''}/alterada${entregasAfetadas > 1 ? 's' : ''} depois desse backup.</strong>
+      </div>` : ''}
+    ${clientesAfetados > 0 ? `<div class="hint" style="margin-bottom:12px;">Também ${clientesAfetados} loja(s) cadastrada(s) depois desse backup deixariam de existir.</div>` : ''}
+    <div class="hint" style="margin-bottom:10px;">Antes de restaurar, o app vai salvar automaticamente um backup do que está aqui agora, então dá pra desfazer se for engano.</div>
+    <div class="field">
+      <label>Para confirmar, digite <strong>RESTAURAR</strong></label>
+      <input type="text" id="f-confirma-restaurar" autocomplete="off" autocapitalize="characters" placeholder="RESTAURAR">
+    </div>
+    <div class="formbtns">
+      <button class="btn ghost block" onclick="closeModal()">Cancelar</button>
+      <button class="btn primary block" style="background:var(--coral-dark);" onclick="confirmarRestaurarBackupLocal()">Restaurar mesmo assim</button>
+    </div>
+  `;
+  openModal(html);
+}
+
+function confirmarRestaurarBackupLocal() {
+  const digitado = (document.getElementById('f-confirma-restaurar').value || '').trim().toUpperCase();
+  if (digitado !== 'RESTAURAR') { toast('Digite RESTAURAR (em maiúsculas) para confirmar.'); return; }
+
+  const raw = localStorage.getItem('picole_backup_pre_import');
+  if (!raw) { toast('Nenhum backup local encontrado neste aparelho.'); closeModal(); return; }
+  let snapshot;
+  try { snapshot = JSON.parse(raw); } catch (e) { toast('Backup corrompido.'); closeModal(); return; }
+
+  // salva o estado atual antes de sobrescrever, pra sempre dar pra voltar atrás
+  try {
+    const snapshotAtual = { clientes: DB.clientes, feriados: DB.feriados, entregas: DB.entregas, motoristas: DB.motoristas, criadoEm: Date.now() };
+    localStorage.setItem('picole_backup_antes_de_restaurar', JSON.stringify(snapshotAtual));
+  } catch (e) {
+    console.error('backup de segurança antes de restaurar falhou', e);
+  }
+
+  DB.clientes = snapshot.clientes || [];
+  DB.feriados = snapshot.feriados || [];
+  DB.entregas = snapshot.entregas || [];
+  DB.motoristas = snapshot.motoristas || [];
+  migrarTipos();
+  saveDB();
+  closeModal();
+  refreshAll();
+  toast('Backup restaurado. O estado anterior também foi salvo, caso precise desfazer.');
+}
+
+function desfazerRestauracao() {
+  const raw = localStorage.getItem('picole_backup_antes_de_restaurar');
+  if (!raw) { toast('Não há uma restauração recente para desfazer neste aparelho.'); return; }
+  let snapshot;
+  try { snapshot = JSON.parse(raw); } catch (e) { toast('Backup corrompido.'); return; }
+  const quando = new Date(snapshot.criadoEm).toLocaleString('pt-BR');
+  if (!confirm(`Voltar para o estado de antes da última restauração (salvo em ${quando})?`)) return;
   DB.clientes = snapshot.clientes || [];
   DB.feriados = snapshot.feriados || [];
   DB.entregas = snapshot.entregas || [];
@@ -2246,7 +2313,7 @@ function restaurarBackupLocal() {
   migrarTipos();
   saveDB();
   refreshAll();
-  toast('Backup restaurado.');
+  toast('Restauração desfeita.');
 }
 
 document.getElementById('file-import').addEventListener('change', async (ev) => {
