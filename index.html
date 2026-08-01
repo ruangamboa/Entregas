@@ -239,7 +239,6 @@ a.link{color:var(--teal-700);font-weight:700;text-decoration:none;}
       <h1 id="topbar-title">Painel</h1>
       <div class="sub" id="topbar-sub">Entregas Picolé</div>
     </div>
-    <button class="icon-btn" onclick="showScreen('mais')">⋮</button>
   </div>
 
   <!-- ============ PAINEL ============ -->
@@ -276,6 +275,10 @@ a.link{color:var(--teal-700);font-weight:700;text-decoration:none;}
       </div>
       <div class="settings-item" id="item-resumo" onclick="showScreen('resumo')" style="cursor:pointer;">
         <div><div class="t">Resumo mensal</div><div class="d">Quantidade entregue por mês e por loja</div></div>
+        <div>›</div>
+      </div>
+      <div class="settings-item" id="item-resumo-geral" onclick="showScreen('resumo-geral')" style="cursor:pointer;">
+        <div><div class="t">Resumo geral</div><div class="d">Junta Personalizadas + Comuns + Diretas por mês</div></div>
         <div>›</div>
       </div>
       <div class="settings-item" onclick="showScreen('feriados')" style="cursor:pointer;">
@@ -337,6 +340,11 @@ a.link{color:var(--teal-700);font-weight:700;text-decoration:none;}
     <div id="resumo-container"></div>
   </div>
 
+  <!-- ============ RESUMO GERAL (3 tipos) ============ -->
+  <div class="screen" id="screen-resumo-geral">
+    <div id="resumo-geral-container"></div>
+  </div>
+
   <!-- ============ FERIADOS ============ -->
   <div class="screen" id="screen-feriados">
     <div id="feriados-list"></div>
@@ -349,11 +357,51 @@ a.link{color:var(--teal-700);font-weight:700;text-decoration:none;}
   </div>
   <button class="fab" id="fab-motorista" style="display:none;" onclick="openMotoristaForm()">+</button>
 
+  <!-- ============ FINANCEIRO: LANÇAMENTOS ============ -->
+  <div class="screen" id="screen-fin-lancamentos">
+    <div id="fin-lancamentos-list"></div>
+  </div>
+  <button class="fab" id="fab-lancamento" style="display:none;" onclick="openLancamentoForm()">+</button>
+
+  <!-- ============ FINANCEIRO: RELATÓRIO POR PERÍODO ============ -->
+  <div class="screen" id="screen-fin-relatorio">
+    <div id="fin-relatorio-container"></div>
+  </div>
+
+  <!-- ============ FINANCEIRO: RESUMO MENSAL ============ -->
+  <div class="screen" id="screen-fin-resumo">
+    <div id="fin-resumo-container"></div>
+  </div>
+
+  <!-- ============ FINANCEIRO: MAIS ============ -->
+  <div class="screen" id="screen-fin-mais">
+    <div class="section-title">Configurações</div>
+    <div class="card" style="padding:4px 16px;">
+      <div class="settings-item" id="item-fin-categorias" onclick="showScreen('fin-categorias')" style="cursor:pointer;">
+        <div><div class="t">Categorias</div><div class="d">Tipos de entrada e de despesa</div></div>
+        <div>›</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ FINANCEIRO: CATEGORIAS ============ -->
+  <div class="screen" id="screen-fin-categorias">
+    <div id="fin-categorias-list"></div>
+  </div>
+  <button class="fab" id="fab-categoria" style="display:none;" onclick="openCategoriaFinanceiraForm()">+</button>
+
   <div class="tabbar">
-    <button class="tab active" data-tab="painel" onclick="showScreen('painel')"><span class="ic">📋</span>Painel</button>
-    <button class="tab" data-tab="entregas" onclick="showScreen('entregas')"><span class="ic">🚚</span>Entregas</button>
-    <button class="tab" data-tab="pagamentos" onclick="showScreen('pagamentos')"><span class="ic">💰</span>Pagamentos</button>
-    <button class="tab" data-tab="mais" onclick="showScreen('mais')"><span class="ic">⋯</span>Mais</button>
+    <button class="tab area-entregas active" data-tab="painel" onclick="showScreen('painel')"><span class="ic">📋</span>Painel</button>
+    <button class="tab area-entregas" data-tab="entregas" onclick="showScreen('entregas')"><span class="ic">🚚</span>Entregas</button>
+    <button class="tab area-entregas" data-tab="pagamentos" onclick="showScreen('pagamentos')"><span class="ic">💰</span>Pagamentos</button>
+    <button class="tab area-entregas" data-tab="mais" onclick="showScreen('mais')"><span class="ic">⋯</span>Mais</button>
+
+    <button class="tab area-financeiro" style="display:none;" data-tab="fin-lancamentos" onclick="showScreen('fin-lancamentos')"><span class="ic">💵</span>Lançar</button>
+    <button class="tab area-financeiro" style="display:none;" data-tab="fin-relatorio" onclick="showScreen('fin-relatorio')"><span class="ic">📑</span>Relatório</button>
+    <button class="tab area-financeiro" style="display:none;" data-tab="fin-resumo" onclick="showScreen('fin-resumo')"><span class="ic">📆</span>Resumo</button>
+    <button class="tab area-financeiro" style="display:none;" data-tab="fin-mais" onclick="showScreen('fin-mais')"><span class="ic">⋯</span>Mais</button>
+
+    <button class="tab" data-tab="areas" onclick="abrirSeletorAreas()"><span class="ic">☰</span>Áreas</button>
   </div>
 </div>
 

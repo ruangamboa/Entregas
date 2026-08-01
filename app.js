@@ -97,6 +97,8 @@ function defaultDB() {
     feriados: FERIADOS_PADRAO.map(([data, descricao]) => ({ id: uid('f'), data, descricao })),
     entregas: [],
     motoristas: [],
+    categoriasFinanceiras: [],
+    lancamentos: [],
   };
 }
 
@@ -116,6 +118,8 @@ function loadDB() {
       if (!DB.feriados) DB.feriados = [];
       if (!DB.entregas) DB.entregas = [];
       if (!DB.motoristas) DB.motoristas = [];
+      if (!DB.categoriasFinanceiras) DB.categoriasFinanceiras = [];
+      if (!DB.lancamentos) DB.lancamentos = [];
       migrarTipos();
       return;
     }
@@ -284,6 +288,9 @@ async function atualizarPapelEDataAposLogin() {
     if (MEU_PAPEL) {
       await sincronizar(true);
     }
+    if (AREA_ATUAL === 'financeiro' && !podeVerResumoEFinanceiro()) {
+      trocarArea('entregas');
+    }
   } catch (err) {
     console.error('falha ao checar papel', err);
     toast('Erro ao conectar com a nuvem: ' + (err && err.code ? err.code : (err && err.message) || 'desconhecido'));
@@ -366,6 +373,10 @@ async function pushParaNuvem() {
         motoristasJson: JSON.stringify(DB.motoristas),
         updatedAt: now,
       }, { merge: true });
+      await ref.collection('financeiroConfig').doc('categorias').set({
+        json: JSON.stringify(DB.categoriasFinanceiras),
+        updatedAt: now,
+      });
     }
 
     if (podeEditarEntregas()) {
@@ -374,6 +385,17 @@ async function pushParaNuvem() {
         const batch = firebase.firestore().batch();
         alteradas.forEach(e => {
           batch.set(ref.collection('entregas').doc(e.id), e);
+        });
+        await batch.commit();
+      }
+    }
+
+    if (podeGerenciar()) {
+      const lancAlterados = DB.lancamentos.filter(l => (l.updatedAt || 0) > lastCloudPushAt);
+      if (lancAlterados.length > 0) {
+        const batch = firebase.firestore().batch();
+        lancAlterados.forEach(l => {
+          batch.set(ref.collection('lancamentos').doc(l.id), l);
         });
         await batch.commit();
       }
@@ -415,9 +437,20 @@ async function sincronizar(silencioso) {
       if (cloudData.motoristasJson) DB.motoristas = JSON.parse(cloudData.motoristasJson);
     }
 
+    if (podeVerResumoEFinanceiro()) {
+      const catDoc = await ref.collection('financeiroConfig').doc('categorias').get();
+      if (catDoc.exists && catDoc.data().json) DB.categoriasFinanceiras = JSON.parse(catDoc.data().json);
+    }
+
     const entregasSnap = await ref.collection('entregas').get();
     const daNuvem = entregasSnap.docs.map(d => d.data());
     DB.entregas = mesclarEntregasPorId(DB.entregas, daNuvem);
+
+    if (podeVerResumoEFinanceiro()) {
+      const lancSnap = await ref.collection('lancamentos').get();
+      const lancNuvem = lancSnap.docs.map(d => d.data());
+      DB.lancamentos = mesclarEntregasPorId(DB.lancamentos, lancNuvem);
+    }
 
     migrarTipos(); // dados vindos da nuvem podem ser de antes dos tipos de cliente existirem
 
@@ -826,6 +859,85 @@ function getResumoMensal(tipo) {
   return { meses, linhas, totais, totalGeral };
 }
 
+/* ---------------- Resumo Geral (juntando os 3 tipos) ---------------- */
+function getResumoGeralMensal() {
+  const entregas = entregasAtivas(); // todos os tipos
+  if (entregas.length === 0) return { meses: [], linhas: [], totalGeral: { personalizada: 0, comum: 0, direta: 0, total: 0 } };
+
+  const datasOrdenadas = entregas.map(e => e.data).sort();
+  let inicio = parseDate(datasOrdenadas[0]);
+  inicio = new Date(inicio.getFullYear(), inicio.getMonth(), 1, 12);
+  const hoje = new Date();
+  let fimRef = new Date(Math.max(
+    parseDate(datasOrdenadas[datasOrdenadas.length - 1]).getTime(),
+    hoje.getTime()
+  ));
+  fimRef = new Date(fimRef.getFullYear(), fimRef.getMonth(), 1, 12);
+
+  const meses = [];
+  let cursor = new Date(inicio);
+  while (cursor <= fimRef) {
+    meses.push(dateToKey(cursor));
+    cursor.setMonth(cursor.getMonth() + 1);
+  }
+
+  const linhas = meses.map(mesKey => {
+    const fimMesDate = parseDate(mesKey);
+    fimMesDate.setMonth(fimMesDate.getMonth() + 1);
+    const fimMes = dateToKey(fimMesDate);
+    const doMes = entregas.filter(e => e.data >= mesKey && e.data < fimMes);
+    const porTipo = { personalizada: 0, comum: 0, direta: 0 };
+    doMes.forEach(e => { porTipo[e.tipo] = (porTipo[e.tipo] || 0) + (Number(e.quantidade) || 0); });
+    const total = porTipo.personalizada + porTipo.comum + porTipo.direta;
+    return { mes: mesKey, ...porTipo, total };
+  });
+
+  const totalGeral = {
+    personalizada: linhas.reduce((s, l) => s + l.personalizada, 0),
+    comum: linhas.reduce((s, l) => s + l.comum, 0),
+    direta: linhas.reduce((s, l) => s + l.direta, 0),
+    total: linhas.reduce((s, l) => s + l.total, 0),
+  };
+
+  return { meses, linhas, totalGeral };
+}
+
+function renderResumoGeral() {
+  const el = document.getElementById('resumo-geral-container');
+  const { meses, linhas, totalGeral } = getResumoGeralMensal();
+  if (meses.length === 0) {
+    el.innerHTML = emptyState('📊', 'Sem dados ainda', 'Assim que houver entregas registradas em qualquer um dos tipos, o resumo geral aparece aqui.');
+    return;
+  }
+  const bodyRows = linhas.slice().reverse().map(l => `
+    <tr>
+      <td>${fmtMesAno(l.mes)}</td>
+      <td>${l.personalizada}</td>
+      <td>${l.comum}</td>
+      <td>${l.direta}</td>
+      <td><strong>${l.total}</strong></td>
+    </tr>
+  `).join('');
+  const totalRow = `
+    <tr class="total-row">
+      <td>Total geral</td>
+      <td>${totalGeral.personalizada}</td>
+      <td>${totalGeral.comum}</td>
+      <td>${totalGeral.direta}</td>
+      <td>${totalGeral.total}</td>
+    </tr>
+  `;
+  el.innerHTML = `
+    <div class="hint" style="margin-bottom:12px;">Quantidade de picolés entregues/vendidos por mês, somando os 3 tipos.</div>
+    <div class="table-wrap">
+      <table class="resumo">
+        <thead><tr><th>Mês</th><th>${TIPO_LABEL_CURTO.personalizada}</th><th>${TIPO_LABEL_CURTO.comum}</th><th>${TIPO_LABEL_CURTO.direta}</th><th>Total</th></tr></thead>
+        <tbody>${totalRow}${bodyRows}</tbody>
+      </table>
+    </div>
+  `;
+}
+
 /* =========================================================
    Navegação
    ========================================================= */
@@ -836,22 +948,89 @@ const TITULOS = {
   mais: ['Mais', 'Cadastros e dados'],
   clientes: ['Lojas', 'Cadastro de clientes'],
   resumo: ['Resumo mensal', 'Picolés entregues por mês'],
+  'resumo-geral': ['Resumo geral', 'Personalizadas + Comuns + Diretas'],
   feriados: ['Feriados', 'Dias ignorados no cálculo'],
   motoristas: ['Motoristas', 'Cadastro de motoristas'],
+  'fin-lancamentos': ['Lançamentos', 'Entradas e saídas recentes'],
+  'fin-relatorio': ['Relatório', 'Entradas e saídas por período'],
+  'fin-resumo': ['Resumo mensal', 'Financeiro por mês'],
+  'fin-mais': ['Mais', 'Configurações do financeiro'],
+  'fin-categorias': ['Categorias', 'Tipos de entrada e despesa'],
 };
 
+const AREAS = {
+  entregas: ['painel', 'entregas', 'pagamentos', 'mais', 'clientes', 'resumo', 'resumo-geral', 'feriados', 'motoristas'],
+  financeiro: ['fin-lancamentos', 'fin-relatorio', 'fin-resumo', 'fin-mais', 'fin-categorias'],
+};
+const TAB_MAP_POR_AREA = {
+  entregas: { painel: 'painel', entregas: 'entregas', pagamentos: 'pagamentos' },
+  financeiro: { 'fin-lancamentos': 'fin-lancamentos', 'fin-relatorio': 'fin-relatorio', 'fin-resumo': 'fin-resumo' },
+};
+const TAB_PADRAO_POR_AREA = { entregas: 'mais', financeiro: 'fin-mais' };
+const TELA_INICIAL_POR_AREA = { entregas: 'painel', financeiro: 'fin-lancamentos' };
+
+let AREA_ATUAL = localStorage.getItem('picole_area_atual') || 'entregas';
+if (!AREAS[AREA_ATUAL]) AREA_ATUAL = 'entregas';
+
+function areaDaTela(name) {
+  return AREAS.financeiro.includes(name) ? 'financeiro' : 'entregas';
+}
+
+function abrirSeletorAreas() {
+  const html = `
+    <div class="modal-header">
+      <h2>Áreas</h2>
+      <button class="close-x" onclick="closeModal()">✕</button>
+    </div>
+    <div class="card" onclick="closeModal(); trocarArea('entregas')" style="cursor:pointer;margin-bottom:10px;">
+      <div class="card-row">
+        <div><div class="card-title">🚚 Entregas</div><div class="card-sub">Painel, entregas, pagamentos e cadastros</div></div>
+        <div>›</div>
+      </div>
+    </div>
+    ${podeVerResumoEFinanceiro() ? `
+    <div class="card" onclick="closeModal(); trocarArea('financeiro')" style="cursor:pointer;">
+      <div class="card-row">
+        <div><div class="card-title">💰 Financeiro</div><div class="card-sub">Lançamentos, relatórios e resumo mensal</div></div>
+        <div>›</div>
+      </div>
+    </div>` : ''}
+  `;
+  openModal(html);
+}
+
+function trocarArea(area) {
+  if (!AREAS[area]) return;
+  AREA_ATUAL = area;
+  localStorage.setItem('picole_area_atual', area);
+  showScreen(TELA_INICIAL_POR_AREA[area]);
+}
+
+function atualizarTabbarPorArea() {
+  document.querySelectorAll('.tab.area-entregas').forEach(t => t.style.display = AREA_ATUAL === 'entregas' ? '' : 'none');
+  document.querySelectorAll('.tab.area-financeiro').forEach(t => t.style.display = AREA_ATUAL === 'financeiro' ? '' : 'none');
+}
+
 function showScreen(name) {
-  if (name === 'resumo' && !podeVerResumoEFinanceiro()) {
+  if ((name === 'resumo' || name === 'resumo-geral') && !podeVerResumoEFinanceiro()) {
     toast('Você não tem acesso ao Resumo Mensal.');
     name = 'mais';
   }
+  if (areaDaTela(name) === 'financeiro' && !podeVerResumoEFinanceiro()) {
+    toast('Você não tem acesso à área financeira.');
+    name = 'painel';
+  }
+
+  AREA_ATUAL = areaDaTela(name);
+  localStorage.setItem('picole_area_atual', AREA_ATUAL);
+  atualizarTabbarPorArea();
 
   document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
   document.getElementById('screen-' + name).classList.add('active');
 
   document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-  const tabMap = { painel: 'painel', entregas: 'entregas', pagamentos: 'pagamentos' };
-  const activeTab = tabMap[name] || 'mais';
+  const tabMap = TAB_MAP_POR_AREA[AREA_ATUAL] || {};
+  const activeTab = tabMap[name] || TAB_PADRAO_POR_AREA[AREA_ATUAL];
   const tabEl = document.querySelector(`.tab[data-tab="${activeTab}"]`);
   if (tabEl) tabEl.classList.add('active');
 
@@ -865,6 +1044,8 @@ function showScreen(name) {
   document.getElementById('fab-cliente').style.display = (name === 'clientes' && podeGerenciar()) ? 'flex' : 'none';
   document.getElementById('fab-feriado').style.display = (name === 'feriados' && podeGerenciar()) ? 'flex' : 'none';
   document.getElementById('fab-motorista').style.display = (name === 'motoristas' && podeGerenciar()) ? 'flex' : 'none';
+  document.getElementById('fab-lancamento').style.display = (name === 'fin-lancamentos' && podeGerenciar()) ? 'flex' : 'none';
+  document.getElementById('fab-categoria').style.display = (name === 'fin-categorias' && podeGerenciar()) ? 'flex' : 'none';
 
   renderScreen(name);
 }
@@ -875,19 +1056,32 @@ function renderScreen(name) {
   else if (name === 'pagamentos') renderPagamentos();
   else if (name === 'clientes') renderClientes();
   else if (name === 'resumo') renderResumo();
+  else if (name === 'resumo-geral') renderResumoGeral();
   else if (name === 'feriados') renderFeriados();
   else if (name === 'motoristas') renderMotoristas();
+  else if (name === 'fin-lancamentos') renderFinLancamentos();
+  else if (name === 'fin-relatorio') renderFinRelatorio();
+  else if (name === 'fin-resumo') renderFinResumoMensal();
+  else if (name === 'fin-categorias') renderCategoriasFinanceiras();
 }
 
 function refreshAll() {
   renderPainel(); renderEntregas(); renderPagamentos();
-  renderClientes(); renderResumo(); renderFeriados(); renderMotoristas(); renderSyncStatus();
+  renderClientes(); renderResumo(); renderResumoGeral(); renderFeriados(); renderMotoristas(); renderSyncStatus();
+  if (podeVerResumoEFinanceiro()) {
+    renderFinLancamentos();
+    if (document.getElementById('screen-fin-relatorio').classList.contains('active')) renderFinRelatorioResultado();
+    if (document.getElementById('screen-fin-resumo').classList.contains('active')) renderFinResumoMensal();
+    renderCategoriasFinanceiras();
+  }
   atualizarVisibilidadePermissoes();
 }
 
 function atualizarVisibilidadePermissoes() {
   const itemResumo = document.getElementById('item-resumo');
   if (itemResumo) itemResumo.style.display = podeVerResumoEFinanceiro() ? '' : 'none';
+  const itemResumoGeral = document.getElementById('item-resumo-geral');
+  if (itemResumoGeral) itemResumoGeral.style.display = podeVerResumoEFinanceiro() ? '' : 'none';
   const itemImportar = document.getElementById('item-importar');
   if (itemImportar) itemImportar.style.display = podeImportar() ? '' : 'none';
   const itemExportar = document.getElementById('item-exportar');
@@ -896,6 +1090,9 @@ function atualizarVisibilidadePermissoes() {
   if (itemRestaurar) itemRestaurar.style.display = podeImportar() ? '' : 'none';
   const itemDesfazer = document.getElementById('item-desfazer-restauracao');
   if (itemDesfazer) itemDesfazer.style.display = podeImportar() ? '' : 'none';
+  const itemFinCategorias = document.getElementById('item-fin-categorias');
+  if (itemFinCategorias) itemFinCategorias.style.display = podeGerenciar() ? '' : 'none';
+  atualizarTabbarPorArea();
 }
 
 /* ---------------- Toast ---------------- */
@@ -1128,15 +1325,19 @@ function saveEntrega(id) {
     return;
   }
 
+  let entregaSalva;
   if (id) {
     if (!confirm('Salvar as alterações feitas nesta entrega?')) {
       return;
     }
     const e = DB.entregas.find(x => x.id === id);
     Object.assign(e, { cliente, data, quantidade, motorista, observacoes, valorUnitario, dataPagamento, obsPagamento, updatedAt: Date.now() });
+    entregaSalva = e;
   } else {
-    DB.entregas.push({ id: uid('e'), tipo: TIPO_ATUAL, cliente, data, quantidade, motorista, observacoes, valorUnitario, dataPagamento, obsPagamento, updatedAt: Date.now(), deletado: false });
+    entregaSalva = { id: uid('e'), tipo: TIPO_ATUAL, cliente, data, quantidade, motorista, observacoes, valorUnitario, dataPagamento, obsPagamento, updatedAt: Date.now(), deletado: false };
+    DB.entregas.push(entregaSalva);
   }
+  sincronizarLancamentoAutoEntrega(entregaSalva);
   saveDB();
   closeModal();
   refreshAll();
@@ -1308,13 +1509,17 @@ function saveEntregaComum(id) {
     return;
   }
 
+  let entregaSalva;
   if (id) {
     if (!confirm('Salvar as alterações feitas nesta entrega?')) return;
     const e = DB.entregas.find(x => x.id === id);
     Object.assign(e, { cliente, data, quantidade, motorista, observacoes, parcelas, updatedAt: Date.now() });
+    entregaSalva = e;
   } else {
-    DB.entregas.push({ id: uid('e'), tipo: 'comum', cliente, data, quantidade, motorista, observacoes, parcelas, updatedAt: Date.now(), deletado: false });
+    entregaSalva = { id: uid('e'), tipo: 'comum', cliente, data, quantidade, motorista, observacoes, parcelas, updatedAt: Date.now(), deletado: false };
+    DB.entregas.push(entregaSalva);
   }
+  sincronizarParcelasComumFinanceiro(entregaSalva);
   saveDB();
   closeModal();
   refreshAll();
@@ -1330,6 +1535,7 @@ function deleteEntrega(id) {
     // proxima sincronizacao com outros aparelhos.
     e.deletado = true;
     e.updatedAt = Date.now();
+    removerLancamentosDaEntrega(id);
   }
   saveDB();
   closeModal();
@@ -1485,6 +1691,7 @@ function confirmarPagamentoParcela(entregaId, parcelaId) {
   if (!data) { toast('Escolha a data do pagamento.'); return; }
   p.dataPagamento = data;
   e.updatedAt = Date.now();
+  sincronizarParcelasComumFinanceiro(e);
   saveDB();
   closeModal();
   refreshAll();
@@ -1525,6 +1732,7 @@ function confirmarPagamento(id) {
   e.dataPagamento = data;
   e.obsPagamento = document.getElementById('f-confirma-obs-pagto').value.trim();
   e.updatedAt = Date.now();
+  sincronizarLancamentoAutoEntrega(e);
   saveDB();
   closeModal();
   refreshAll();
@@ -2112,6 +2320,502 @@ function deleteMotorista(id) {
 }
 
 /* =========================================================
+   FINANCEIRO
+   ========================================================= */
+const CATEGORIA_VENDA = {
+  personalizada: 'Vendas de Entregas Personalizadas',
+  comum: 'Vendas de Entregas Comuns',
+  direta: 'Vendas de Vendas Diretas',
+};
+
+function garantirCategoriasVenda() {
+  TIPOS_CLIENTE.forEach(t => {
+    const nome = CATEGORIA_VENDA[t];
+    if (!DB.categoriasFinanceiras.some(c => c.tipo === 'entrada' && c.nome === nome)) {
+      DB.categoriasFinanceiras.push({ id: uid('cf'), tipo: 'entrada', nome, ativo: true, sistema: true });
+    }
+  });
+}
+
+function categoriasFinanceirasDoTipo(tipoMov) {
+  garantirCategoriasVenda();
+  return DB.categoriasFinanceiras.filter(c => c.tipo === (tipoMov === 'entrada' ? 'entrada' : 'despesa') && c.ativo !== false)
+    .slice().sort((a, b) => a.nome.localeCompare(b.nome));
+}
+
+function lancamentosAtivos() {
+  return DB.lancamentos.filter(l => !l.deletado);
+}
+
+/* ---- sincronização automática: pagamentos de entregas -> lançamentos ---- */
+function sincronizarLancamentoAutoEntrega(entrega) {
+  garantirCategoriasVenda();
+  const existente = DB.lancamentos.find(l => !l.deletado && l.origem && l.origem.entregaId === entrega.id && !l.origem.parcelaId);
+  if (entrega.dataPagamento) {
+    const valor = valorTotalEntrega(entrega);
+    if (existente) {
+      Object.assign(existente, {
+        valor, data: entrega.dataPagamento, categoria: CATEGORIA_VENDA[entrega.tipo],
+        observacoes: entrega.obsPagamento || '', updatedAt: Date.now(),
+      });
+    } else {
+      DB.lancamentos.push({
+        id: uid('lc'), tipoMov: 'entrada', categoria: CATEGORIA_VENDA[entrega.tipo], valor,
+        data: entrega.dataPagamento, observacoes: entrega.obsPagamento || '', automatico: true,
+        origem: { entregaId: entrega.id, tipoCliente: entrega.tipo },
+        criadoPor: AUTH_USER ? AUTH_USER.email : null, updatedAt: Date.now(), deletado: false,
+      });
+    }
+  } else if (existente) {
+    existente.deletado = true;
+    existente.updatedAt = Date.now();
+  }
+}
+
+function sincronizarParcelasComumFinanceiro(entrega) {
+  garantirCategoriasVenda();
+  // remove lançamentos de parcelas que não existem mais nessa entrega (ex: após "recalcular parcelas")
+  const idsAtuais = new Set((entrega.parcelas || []).map(p => p.id));
+  DB.lancamentos.forEach(l => {
+    if (!l.deletado && l.origem && l.origem.entregaId === entrega.id && l.origem.parcelaId && !idsAtuais.has(l.origem.parcelaId)) {
+      l.deletado = true;
+      l.updatedAt = Date.now();
+    }
+  });
+  (entrega.parcelas || []).forEach(p => {
+    const existente = DB.lancamentos.find(l => !l.deletado && l.origem && l.origem.entregaId === entrega.id && l.origem.parcelaId === p.id);
+    if (p.dataPagamento) {
+      const valor = Number(p.valor) || 0;
+      if (existente) {
+        Object.assign(existente, { valor, data: p.dataPagamento, categoria: CATEGORIA_VENDA[entrega.tipo], updatedAt: Date.now() });
+      } else {
+        DB.lancamentos.push({
+          id: uid('lc'), tipoMov: 'entrada', categoria: CATEGORIA_VENDA[entrega.tipo], valor,
+          data: p.dataPagamento, observacoes: '', automatico: true,
+          origem: { entregaId: entrega.id, parcelaId: p.id, tipoCliente: entrega.tipo },
+          criadoPor: AUTH_USER ? AUTH_USER.email : null, updatedAt: Date.now(), deletado: false,
+        });
+      }
+    } else if (existente) {
+      existente.deletado = true;
+      existente.updatedAt = Date.now();
+    }
+  });
+}
+
+function removerLancamentosDaEntrega(entregaId) {
+  DB.lancamentos.forEach(l => {
+    if (!l.deletado && l.origem && l.origem.entregaId === entregaId) {
+      l.deletado = true;
+      l.updatedAt = Date.now();
+    }
+  });
+}
+
+/* ---- Categorias financeiras (CRUD) ---- */
+function renderCategoriasFinanceiras() {
+  garantirCategoriasVenda();
+  const el = document.getElementById('fin-categorias-list');
+  const entradas = DB.categoriasFinanceiras.filter(c => c.tipo === 'entrada').sort((a, b) => a.nome.localeCompare(b.nome));
+  const despesas = DB.categoriasFinanceiras.filter(c => c.tipo === 'despesa').sort((a, b) => a.nome.localeCompare(b.nome));
+
+  const linha = (c) => `
+    <div class="card" ${c.sistema ? '' : `onclick="openCategoriaFinanceiraForm('${c.id}')" style="cursor:pointer;"`}>
+      <div class="card-row">
+        <div>
+          <div class="card-title">${escapeHtml(c.nome)}</div>
+          ${c.sistema ? '<div class="card-sub">Categoria automática (ligada aos pagamentos)</div>' : ''}
+        </div>
+        <span class="badge ${c.ativo === false ? 'grey' : 'green'}">${c.ativo === false ? 'Inativa' : 'Ativa'}</span>
+      </div>
+    </div>`;
+
+  el.innerHTML = `
+    <div class="section-title">Categorias de entrada</div>
+    ${entradas.map(linha).join('') || emptyState('💵', 'Nenhuma categoria de entrada', '')}
+    <div class="section-title" style="margin-top:16px;">Categorias de despesa</div>
+    ${despesas.map(linha).join('') || emptyState('🧾', 'Nenhuma categoria de despesa ainda', 'Toque no botão + para criar (ex: Gasolina, Pedágio).')}
+  `;
+}
+
+function openCategoriaFinanceiraForm(id) {
+  if (!podeGerenciar()) { toast('Só administradores e gerentes podem editar categorias.'); return; }
+  const editando = !!id;
+  const c = editando ? DB.categoriasFinanceiras.find(x => x.id === id) : null;
+  if (editando && c.sistema) { toast('Essa categoria é automática e não pode ser editada.'); return; }
+  const html = `
+    <div class="modal-header">
+      <h2>${editando ? 'Editar categoria' : 'Nova categoria'}</h2>
+      <button class="close-x" onclick="closeModal()">✕</button>
+    </div>
+    <div class="field">
+      <label>Tipo</label>
+      <select id="f-cat-tipo" ${editando ? 'disabled' : ''}>
+        <option value="entrada" ${!c || c.tipo === 'entrada' ? 'selected' : ''}>Entrada</option>
+        <option value="despesa" ${c && c.tipo === 'despesa' ? 'selected' : ''}>Despesa</option>
+      </select>
+    </div>
+    <div class="field">
+      <label>Nome da categoria</label>
+      <input type="text" id="f-cat-nome" value="${c ? escapeHtml(c.nome) : ''}" placeholder="Ex: Gasolina, Pedágio, Salário de fulano">
+    </div>
+    <div class="field">
+      <label>Status</label>
+      <select id="f-cat-ativo">
+        <option value="true" ${!c || c.ativo !== false ? 'selected' : ''}>Ativa</option>
+        <option value="false" ${c && c.ativo === false ? 'selected' : ''}>Inativa</option>
+      </select>
+    </div>
+    <div class="formbtns">
+      <button class="btn ghost block" onclick="closeModal()">Cancelar</button>
+      <button class="btn primary block" onclick="saveCategoriaFinanceira(${editando ? `'${id}'` : 'null'})">Salvar</button>
+    </div>
+    ${editando ? `<button class="danger-link" onclick="deleteCategoriaFinanceira('${id}')">Excluir esta categoria</button>` : ''}
+  `;
+  openModal(html);
+}
+
+function saveCategoriaFinanceira(id) {
+  const tipo = document.getElementById('f-cat-tipo').value;
+  const nome = document.getElementById('f-cat-nome').value.trim();
+  const ativo = document.getElementById('f-cat-ativo').value === 'true';
+  if (!nome) { toast('Digite o nome da categoria.'); return; }
+  const duplicada = DB.categoriasFinanceiras.some(c => c.nome === nome && c.tipo === tipo && c.id !== id);
+  if (duplicada) { toast('Já existe uma categoria com esse nome nesse tipo.'); return; }
+  if (id) {
+    Object.assign(DB.categoriasFinanceiras.find(x => x.id === id), { nome, ativo });
+  } else {
+    DB.categoriasFinanceiras.push({ id: uid('cf'), tipo, nome, ativo });
+  }
+  saveDB();
+  closeModal();
+  refreshAll();
+  toast('Categoria salva.');
+}
+
+function deleteCategoriaFinanceira(id) {
+  const c = DB.categoriasFinanceiras.find(x => x.id === id);
+  if (c && c.sistema) { toast('Essa categoria é automática e não pode ser excluída.'); return; }
+  if (!confirm('Excluir esta categoria? Lançamentos já feitos com ela continuam existindo.')) return;
+  DB.categoriasFinanceiras = DB.categoriasFinanceiras.filter(x => x.id !== id);
+  saveDB();
+  closeModal();
+  refreshAll();
+  toast('Categoria excluída.');
+}
+
+/* ---- Lançamentos manuais (CRUD) ---- */
+function openLancamentoForm(id) {
+  if (!podeGerenciar()) { toast('Só administradores e gerentes podem lançar entradas e saídas.'); return; }
+  const editando = !!id;
+  const l = editando ? DB.lancamentos.find(x => x.id === id) : null;
+  if (editando && l.automatico) { toast('Esse lançamento é automático (gerado por um pagamento) e não pode ser editado aqui.'); return; }
+  const tipoMov = l ? l.tipoMov : 'entrada';
+
+  const optionsCategoria = (tm) => categoriasFinanceirasDoTipo(tm).map(c =>
+    `<option value="${escapeHtml(c.nome)}" ${l && l.categoria === c.nome ? 'selected' : ''}>${escapeHtml(c.nome)}</option>`
+  ).join('');
+
+  const html = `
+    <div class="modal-header">
+      <h2>${editando ? 'Editar lançamento' : 'Novo lançamento'}</h2>
+      <button class="close-x" onclick="closeModal()">✕</button>
+    </div>
+    <div class="field">
+      <label>Tipo</label>
+      <select id="f-lanc-tipo" onchange="atualizarCategoriasLancamentoForm()">
+        <option value="entrada" ${tipoMov === 'entrada' ? 'selected' : ''}>Entrada</option>
+        <option value="saida" ${tipoMov === 'saida' ? 'selected' : ''}>Saída (gasto)</option>
+      </select>
+    </div>
+    <div class="field">
+      <label>Categoria</label>
+      <select id="f-lanc-categoria">${optionsCategoria(tipoMov)}</select>
+      ${categoriasFinanceirasDoTipo(tipoMov).length === 0 ? '<div class="hint">Nenhuma categoria cadastrada ainda — crie uma em Financeiro → Categorias.</div>' : ''}
+    </div>
+    <div class="row2">
+      <div class="field">
+        <label>Data</label>
+        <input type="date" id="f-lanc-data" value="${l ? l.data : todayStr()}">
+      </div>
+      <div class="field">
+        <label>Valor</label>
+        <input type="number" id="f-lanc-valor" step="0.01" value="${l ? l.valor : ''}" placeholder="0,00">
+      </div>
+    </div>
+    <div class="field">
+      <label>Observações</label>
+      <textarea id="f-lanc-obs" placeholder="Opcional">${l ? escapeHtml(l.observacoes || '') : ''}</textarea>
+    </div>
+    <div class="formbtns">
+      <button class="btn ghost block" onclick="closeModal()">Cancelar</button>
+      <button class="btn primary block" onclick="saveLancamento(${editando ? `'${id}'` : 'null'})">Salvar</button>
+    </div>
+    ${editando ? `<button class="danger-link" onclick="deleteLancamento('${id}')">Excluir este lançamento</button>` : ''}
+  `;
+  openModal(html);
+}
+
+function atualizarCategoriasLancamentoForm() {
+  const tipoMov = document.getElementById('f-lanc-tipo').value;
+  const el = document.getElementById('f-lanc-categoria');
+  el.innerHTML = categoriasFinanceirasDoTipo(tipoMov).map(c => `<option value="${escapeHtml(c.nome)}">${escapeHtml(c.nome)}</option>`).join('');
+}
+
+function saveLancamento(id) {
+  const tipoMov = document.getElementById('f-lanc-tipo').value;
+  const categoria = document.getElementById('f-lanc-categoria').value;
+  const data = document.getElementById('f-lanc-data').value;
+  const valor = Number(document.getElementById('f-lanc-valor').value) || 0;
+  const observacoes = document.getElementById('f-lanc-obs').value.trim();
+
+  if (!data || !categoria || valor <= 0) {
+    toast('Preencha categoria, data e um valor maior que zero.');
+    return;
+  }
+
+  if (id) {
+    Object.assign(DB.lancamentos.find(x => x.id === id), { tipoMov, categoria, data, valor, observacoes, updatedAt: Date.now() });
+  } else {
+    DB.lancamentos.push({
+      id: uid('lc'), tipoMov, categoria, data, valor, observacoes, automatico: false, origem: null,
+      criadoPor: AUTH_USER ? AUTH_USER.email : null, updatedAt: Date.now(), deletado: false,
+    });
+  }
+  saveDB();
+  closeModal();
+  refreshAll();
+  toast('Lançamento salvo.');
+}
+
+function deleteLancamento(id) {
+  const l = DB.lancamentos.find(x => x.id === id);
+  if (l && l.automatico) { toast('Esse lançamento é automático e não pode ser excluído aqui. Desmarque o pagamento na entrega de origem.'); return; }
+  if (!confirm('Excluir este lançamento?')) return;
+  l.deletado = true;
+  l.updatedAt = Date.now();
+  saveDB();
+  closeModal();
+  refreshAll();
+  toast('Lançamento excluído.');
+}
+
+/* ---- Tela: Lançamentos (lista recente + adicionar) ---- */
+function renderFinLancamentos() {
+  const el = document.getElementById('fin-lancamentos-list');
+  const lista = lancamentosAtivos().slice().sort((a, b) => (a.data < b.data ? 1 : a.data > b.data ? -1 : (b.updatedAt || 0) - (a.updatedAt || 0))).slice(0, 60);
+  const totalEntradas = lancamentosAtivos().filter(l => l.tipoMov === 'entrada').reduce((s, l) => s + l.valor, 0);
+  const totalSaidas = lancamentosAtivos().filter(l => l.tipoMov === 'saida').reduce((s, l) => s + l.valor, 0);
+
+  const kpis = `
+    <div class="row2" style="margin-bottom:14px;">
+      <div class="kpi">
+        <div class="label">Total de entradas</div>
+        <div class="value" style="color:var(--teal-700);">${fmtMoney(totalEntradas)}</div>
+      </div>
+      <div class="kpi">
+        <div class="label">Total de saídas</div>
+        <div class="value" style="color:var(--red-ink);">${fmtMoney(totalSaidas)}</div>
+      </div>
+    </div>`;
+
+  if (lista.length === 0) {
+    el.innerHTML = kpis + emptyState('💵', 'Nenhum lançamento ainda', 'Toque no botão + para lançar uma entrada ou saída manual.');
+    return;
+  }
+
+  el.innerHTML = kpis + `<div class="hint" style="margin-bottom:8px;">Mostrando os 60 lançamentos mais recentes. Para ver por período, use o Relatório.</div>` + lista.map(l => `
+    <div class="card" ${l.automatico ? '' : `onclick="openLancamentoForm('${l.id}')" style="cursor:pointer;"`}>
+      <div class="card-row">
+        <div>
+          <div class="card-title">${escapeHtml(l.categoria)}</div>
+          <div class="card-sub">${fmtDateBR(l.data)}${l.automatico ? ' · automático' : ''}</div>
+        </div>
+        <div class="card-title" style="color:${l.tipoMov === 'entrada' ? 'var(--teal-700)' : 'var(--red-ink)'};">
+          ${l.tipoMov === 'entrada' ? '+' : '−'} ${fmtMoney(l.valor)}
+        </div>
+      </div>
+    </div>
+  `).join('');
+}
+
+/* ---- Tela: Relatório por período ---- */
+function relatorioFinanceiroPeriodo() {
+  const ini = document.getElementById('fin-rel-ini') ? document.getElementById('fin-rel-ini').value : '';
+  const fim = document.getElementById('fin-rel-fim') ? document.getElementById('fin-rel-fim').value : '';
+  return { ini: ini || '0000-01-01', fim: fim || '9999-12-31' };
+}
+
+function renderFinRelatorio() {
+  const wrap = document.getElementById('fin-relatorio-container');
+  const hoje = todayStr();
+  const inicioMes = hoje.slice(0, 8) + '01';
+  wrap.innerHTML = `
+    <div class="row2" style="margin-bottom:10px;">
+      <div class="field">
+        <label>De</label>
+        <input type="date" id="fin-rel-ini" value="${inicioMes}" onchange="renderFinRelatorioResultado()">
+      </div>
+      <div class="field">
+        <label>Até</label>
+        <input type="date" id="fin-rel-fim" value="${hoje}" onchange="renderFinRelatorioResultado()">
+      </div>
+    </div>
+    <div class="pill-select" style="margin-bottom:12px;">
+      <button class="active" id="fin-rel-modo-resumido" onclick="setFinRelatorioModo('resumido')">Resumido</button>
+      <button id="fin-rel-modo-detalhado" onclick="setFinRelatorioModo('detalhado')">Detalhado</button>
+    </div>
+    <div id="fin-relatorio-resultado"></div>
+  `;
+  FIN_RELATORIO_MODO = 'resumido';
+  renderFinRelatorioResultado();
+}
+
+let FIN_RELATORIO_MODO = 'resumido';
+function setFinRelatorioModo(modo) {
+  FIN_RELATORIO_MODO = modo;
+  document.getElementById('fin-rel-modo-resumido').classList.toggle('active', modo === 'resumido');
+  document.getElementById('fin-rel-modo-detalhado').classList.toggle('active', modo === 'detalhado');
+  renderFinRelatorioResultado();
+}
+
+function renderFinRelatorioResultado() {
+  const el = document.getElementById('fin-relatorio-resultado');
+  if (!el) return;
+  const { ini, fim } = relatorioFinanceiroPeriodo();
+  const doPeriodo = lancamentosAtivos().filter(l => l.data >= ini && l.data <= fim);
+  const entradas = doPeriodo.filter(l => l.tipoMov === 'entrada');
+  const saidas = doPeriodo.filter(l => l.tipoMov === 'saida');
+  const totalEntradas = entradas.reduce((s, l) => s + l.valor, 0);
+  const totalSaidas = saidas.reduce((s, l) => s + l.valor, 0);
+  const resultado = totalEntradas - totalSaidas;
+
+  const kpis = `
+    <div class="row2" style="margin-bottom:14px;">
+      <div class="kpi">
+        <div class="label">Entradas</div>
+        <div class="value" style="color:var(--teal-700);">${fmtMoney(totalEntradas)}</div>
+      </div>
+      <div class="kpi">
+        <div class="label">Saídas</div>
+        <div class="value" style="color:var(--red-ink);">${fmtMoney(totalSaidas)}</div>
+      </div>
+    </div>
+    <div class="kpi" style="margin-bottom:14px;background:linear-gradient(135deg,${resultado >= 0 ? '#0E7C7B,#0A4F4E' : '#E5502F,#9A3324'});">
+      <div class="label">Resultado do período</div>
+      <div class="value">${fmtMoney(resultado)}</div>
+    </div>`;
+
+  if (doPeriodo.length === 0) {
+    el.innerHTML = kpis + emptyState('📑', 'Nada nesse período', 'Ajuste as datas acima para ver outro intervalo.');
+    return;
+  }
+
+  if (FIN_RELATORIO_MODO === 'detalhado') {
+    const linhas = doPeriodo.slice().sort((a, b) => (a.data < b.data ? 1 : a.data > b.data ? -1 : 0)).map(l => `
+      <div class="card">
+        <div class="card-row">
+          <div>
+            <div class="card-title">${escapeHtml(l.categoria)}</div>
+            <div class="card-sub">${fmtDateBR(l.data)}${l.automatico ? ' · automático' : ''}${l.observacoes ? ' · ' + escapeHtml(l.observacoes) : ''}</div>
+          </div>
+          <div class="card-title" style="color:${l.tipoMov === 'entrada' ? 'var(--teal-700)' : 'var(--red-ink)'};">
+            ${l.tipoMov === 'entrada' ? '+' : '−'} ${fmtMoney(l.valor)}
+          </div>
+        </div>
+      </div>`).join('');
+    el.innerHTML = kpis + linhas;
+  } else {
+    const agrupar = (lista) => {
+      const mapa = new Map();
+      lista.forEach(l => mapa.set(l.categoria, (mapa.get(l.categoria) || 0) + l.valor));
+      return Array.from(mapa.entries()).sort((a, b) => b[1] - a[1]);
+    };
+    const gruposEntrada = agrupar(entradas);
+    const gruposSaida = agrupar(saidas);
+    const linhaGrupo = (nome, valor, cor) => `
+      <div class="card">
+        <div class="card-row">
+          <div class="card-title">${escapeHtml(nome)}</div>
+          <div class="card-title" style="color:${cor};">${fmtMoney(valor)}</div>
+        </div>
+      </div>`;
+    el.innerHTML = kpis +
+      `<div class="section-title">Entradas por categoria</div>` +
+      (gruposEntrada.map(([nome, valor]) => linhaGrupo(nome, valor, 'var(--teal-700)')).join('') || emptyState('', 'Sem entradas nesse período', '')) +
+      `<div class="section-title" style="margin-top:14px;">Saídas por categoria</div>` +
+      (gruposSaida.map(([nome, valor]) => linhaGrupo(nome, valor, 'var(--red-ink)')).join('') || emptyState('', 'Sem saídas nesse período', ''));
+  }
+}
+
+/* ---- Tela: Resumo mensal financeiro ---- */
+function mesesComLancamentos() {
+  const set = new Set(lancamentosAtivos().map(l => l.data.slice(0, 7)));
+  return Array.from(set).sort().reverse();
+}
+
+let FIN_RESUMO_MES = null;
+function renderFinResumoMensal() {
+  const el = document.getElementById('fin-resumo-container');
+  const meses = mesesComLancamentos();
+  if (meses.length === 0) {
+    el.innerHTML = emptyState('📆', 'Sem dados ainda', 'Assim que houver lançamentos, o resumo por mês aparece aqui.');
+    return;
+  }
+  if (!FIN_RESUMO_MES || !meses.includes(FIN_RESUMO_MES)) FIN_RESUMO_MES = meses[0];
+
+  const seletor = `<select id="fin-resumo-mes-select" onchange="mudarFinResumoMes(this.value)" style="margin-bottom:14px;">
+    ${meses.map(m => `<option value="${m}" ${m === FIN_RESUMO_MES ? 'selected' : ''}>${fmtMesAno(m)}</option>`).join('')}
+  </select>`;
+
+  const doMes = lancamentosAtivos().filter(l => l.data.slice(0, 7) === FIN_RESUMO_MES);
+  const entradas = doMes.filter(l => l.tipoMov === 'entrada');
+  const saidas = doMes.filter(l => l.tipoMov === 'saida');
+  const totalEntradas = entradas.reduce((s, l) => s + l.valor, 0);
+  const totalSaidas = saidas.reduce((s, l) => s + l.valor, 0);
+  const resultado = totalEntradas - totalSaidas;
+
+  const agrupar = (lista) => {
+    const mapa = new Map();
+    lista.forEach(l => mapa.set(l.categoria, (mapa.get(l.categoria) || 0) + l.valor));
+    return Array.from(mapa.entries()).sort((a, b) => b[1] - a[1]);
+  };
+  const linhaGrupo = (nome, valor, cor) => `
+    <div class="card">
+      <div class="card-row">
+        <div class="card-title">${escapeHtml(nome)}</div>
+        <div class="card-title" style="color:${cor};">${fmtMoney(valor)}</div>
+      </div>
+    </div>`;
+
+  el.innerHTML = seletor + `
+    <div class="row2" style="margin-bottom:14px;">
+      <div class="kpi">
+        <div class="label">Entradas</div>
+        <div class="value" style="color:var(--teal-700);">${fmtMoney(totalEntradas)}</div>
+      </div>
+      <div class="kpi">
+        <div class="label">Saídas</div>
+        <div class="value" style="color:var(--red-ink);">${fmtMoney(totalSaidas)}</div>
+      </div>
+    </div>
+    <div class="kpi" style="margin-bottom:14px;background:linear-gradient(135deg,${resultado >= 0 ? '#0E7C7B,#0A4F4E' : '#E5502F,#9A3324'});">
+      <div class="label">Resultado do mês</div>
+      <div class="value">${fmtMoney(resultado)}</div>
+    </div>
+    <div class="section-title">Entradas por categoria</div>
+    ${agrupar(entradas).map(([nome, valor]) => linhaGrupo(nome, valor, 'var(--teal-700)')).join('') || emptyState('', 'Sem entradas nesse mês', '')}
+    <div class="section-title" style="margin-top:14px;">Saídas por categoria</div>
+    ${agrupar(saidas).map(([nome, valor]) => linhaGrupo(nome, valor, 'var(--red-ink)')).join('') || emptyState('', 'Sem saídas nesse mês', '')}
+  `;
+}
+
+function mudarFinResumoMes(mes) {
+  FIN_RESUMO_MES = mes;
+  renderFinResumoMensal();
+}
+
+/* =========================================================
    Helpers de UI
    ========================================================= */
 function emptyState(icone, titulo, texto) {
@@ -2209,7 +2913,7 @@ function triggerImport() {
 
 async function fazerBackupDeSeguranca() {
   const timestamp = Date.now();
-  const snapshot = { clientes: DB.clientes, feriados: DB.feriados, entregas: DB.entregas, motoristas: DB.motoristas, criadoEm: timestamp };
+  const snapshot = { clientes: DB.clientes, feriados: DB.feriados, entregas: DB.entregas, motoristas: DB.motoristas, categoriasFinanceiras: DB.categoriasFinanceiras, lancamentos: DB.lancamentos, criadoEm: timestamp };
   try {
     localStorage.setItem('picole_backup_pre_import', JSON.stringify(snapshot));
   } catch (e) {
@@ -2284,7 +2988,7 @@ function confirmarRestaurarBackupLocal() {
 
   // salva o estado atual antes de sobrescrever, pra sempre dar pra voltar atrás
   try {
-    const snapshotAtual = { clientes: DB.clientes, feriados: DB.feriados, entregas: DB.entregas, motoristas: DB.motoristas, criadoEm: Date.now() };
+    const snapshotAtual = { clientes: DB.clientes, feriados: DB.feriados, entregas: DB.entregas, motoristas: DB.motoristas, categoriasFinanceiras: DB.categoriasFinanceiras, lancamentos: DB.lancamentos, criadoEm: Date.now() };
     localStorage.setItem('picole_backup_antes_de_restaurar', JSON.stringify(snapshotAtual));
   } catch (e) {
     console.error('backup de segurança antes de restaurar falhou', e);
@@ -2294,6 +2998,8 @@ function confirmarRestaurarBackupLocal() {
   DB.feriados = snapshot.feriados || [];
   DB.entregas = snapshot.entregas || [];
   DB.motoristas = snapshot.motoristas || [];
+  DB.categoriasFinanceiras = snapshot.categoriasFinanceiras || [];
+  DB.lancamentos = snapshot.lancamentos || [];
   migrarTipos();
   saveDB();
   closeModal();
@@ -2313,6 +3019,8 @@ function desfazerRestauracao() {
   DB.feriados = snapshot.feriados || [];
   DB.entregas = snapshot.entregas || [];
   DB.motoristas = snapshot.motoristas || [];
+  DB.categoriasFinanceiras = snapshot.categoriasFinanceiras || [];
+  DB.lancamentos = snapshot.lancamentos || [];
   migrarTipos();
   saveDB();
   refreshAll();
@@ -2554,6 +3262,26 @@ async function exportarPlanilha() {
     XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(parcelasRows), 'Parcelas');
   }
 
+  garantirCategoriasVenda();
+  const categoriasRows = DB.categoriasFinanceiras.slice().sort((a, b) => a.nome.localeCompare(b.nome)).map(c => ({
+    'Tipo': c.tipo === 'entrada' ? 'Entrada' : 'Despesa',
+    'Nome': c.nome,
+    'Automática': c.sistema ? 'Sim' : 'Não',
+    'Ativa': c.ativo === false ? 'Não' : 'Sim',
+  }));
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(categoriasRows), 'Categorias Financeiras');
+
+  const lancamentosRows = lancamentosAtivos().slice().sort((a, b) => a.data.localeCompare(b.data)).map(l => ({
+    'ID': l.id,
+    'Tipo': l.tipoMov === 'entrada' ? 'Entrada' : 'Saída',
+    'Categoria': l.categoria,
+    'Data': fmtDateBR(l.data),
+    'Valor': l.valor,
+    'Automático': l.automatico ? 'Sim' : 'Não',
+    'Observações': l.observacoes || '',
+  }));
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(lancamentosRows), 'Financeiro');
+
   const painelRows = DB.clientes.filter(c => c.ativo !== false).map(c => {
     const r = calcPainelCliente(c);
     return {
@@ -2597,4 +3325,5 @@ async function exportarPlanilha() {
    ========================================================= */
 loadDB();
 refreshAll();
+showScreen(TELA_INICIAL_POR_AREA[AREA_ATUAL] || 'painel');
 tentarRetomarLogin();
