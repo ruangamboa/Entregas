@@ -282,6 +282,10 @@ a.link{color:var(--teal-700);font-weight:700;text-decoration:none;}
         <div><div class="t">Feriados</div><div class="d">Datas ignoradas no cálculo de entregas</div></div>
         <div>›</div>
       </div>
+      <div class="settings-item" onclick="showScreen('motoristas')" style="cursor:pointer;">
+        <div><div class="t">Motoristas</div><div class="d">Cadastro de motoristas das entregas</div></div>
+        <div>›</div>
+      </div>
     </div>
 
     <div class="section-title">Sincronização</div>
@@ -334,6 +338,12 @@ a.link{color:var(--teal-700);font-weight:700;text-decoration:none;}
     <div id="feriados-list"></div>
   </div>
   <button class="fab" id="fab-feriado" style="display:none;" onclick="openFeriadoForm()">+</button>
+
+  <!-- ============ MOTORISTAS ============ -->
+  <div class="screen" id="screen-motoristas">
+    <div id="motoristas-list"></div>
+  </div>
+  <button class="fab" id="fab-motorista" style="display:none;" onclick="openMotoristaForm()">+</button>
 
   <div class="tabbar">
     <button class="tab active" data-tab="painel" onclick="showScreen('painel')"><span class="ic">📋</span>Painel</button>

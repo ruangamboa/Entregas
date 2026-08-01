@@ -84,6 +84,7 @@ function defaultDB() {
     clientes: [],
     feriados: FERIADOS_PADRAO.map(([data, descricao]) => ({ id: uid('f'), data, descricao })),
     entregas: [],
+    motoristas: [],
   };
 }
 
@@ -102,6 +103,7 @@ function loadDB() {
       if (!DB.clientes) DB.clientes = [];
       if (!DB.feriados) DB.feriados = [];
       if (!DB.entregas) DB.entregas = [];
+      if (!DB.motoristas) DB.motoristas = [];
       migrarTipos();
       return;
     }
@@ -349,6 +351,7 @@ async function pushParaNuvem() {
       await ref.set({
         clientesJson: JSON.stringify(DB.clientes),
         feriadosJson: JSON.stringify(DB.feriados),
+        motoristasJson: JSON.stringify(DB.motoristas),
         updatedAt: now,
       }, { merge: true });
     }
@@ -397,6 +400,7 @@ async function sincronizar(silencioso) {
     if (cloudData) {
       if (cloudData.clientesJson) DB.clientes = JSON.parse(cloudData.clientesJson);
       if (cloudData.feriadosJson) DB.feriados = JSON.parse(cloudData.feriadosJson);
+      if (cloudData.motoristasJson) DB.motoristas = JSON.parse(cloudData.motoristasJson);
     }
 
     const entregasSnap = await ref.collection('entregas').get();
@@ -821,6 +825,7 @@ const TITULOS = {
   clientes: ['Lojas', 'Cadastro de clientes'],
   resumo: ['Resumo mensal', 'Picolés entregues por mês'],
   feriados: ['Feriados', 'Dias ignorados no cálculo'],
+  motoristas: ['Motoristas', 'Cadastro de motoristas'],
 };
 
 function showScreen(name) {
@@ -847,6 +852,7 @@ function showScreen(name) {
   document.getElementById('fab-entrega').style.display = (name === 'entregas' && podeEditarEntregas()) ? 'flex' : 'none';
   document.getElementById('fab-cliente').style.display = (name === 'clientes' && podeGerenciar()) ? 'flex' : 'none';
   document.getElementById('fab-feriado').style.display = (name === 'feriados' && podeGerenciar()) ? 'flex' : 'none';
+  document.getElementById('fab-motorista').style.display = (name === 'motoristas' && podeGerenciar()) ? 'flex' : 'none';
 
   renderScreen(name);
 }
@@ -858,11 +864,12 @@ function renderScreen(name) {
   else if (name === 'clientes') renderClientes();
   else if (name === 'resumo') renderResumo();
   else if (name === 'feriados') renderFeriados();
+  else if (name === 'motoristas') renderMotoristas();
 }
 
 function refreshAll() {
   renderPainel(); renderEntregas(); renderPagamentos();
-  renderClientes(); renderResumo(); renderFeriados(); renderSyncStatus();
+  renderClientes(); renderResumo(); renderFeriados(); renderMotoristas(); renderSyncStatus();
   atualizarVisibilidadePermissoes();
 }
 
@@ -992,7 +999,7 @@ function renderEntregas() {
         <div class="card-row">
           <div>
             <div class="card-title">${escapeHtml(e.cliente)}</div>
-            <div class="card-sub">${fmtDateBR(e.data)} · ${e.quantidade} un. ${valorTotal > 0 ? '· ' + fmtMoney(valorTotal) : ''}</div>
+            <div class="card-sub">${fmtDateBR(e.data)} · ${e.quantidade} un. ${valorTotal > 0 ? '· ' + fmtMoney(valorTotal) : ''}${e.motorista ? ' · 🚐 ' + escapeHtml(e.motorista) : ''}</div>
           </div>
           <span class="badge ${badgeCls}">${badgeTxt}</span>
         </div>
@@ -1021,6 +1028,7 @@ function openEntregaForm(id) {
   }
 
   const valorInicial = editando ? e.valorUnitario : (ativos[0] ? (ativos[0].valorPadrao || '') : '');
+  const qtdInicial = editando ? e.quantidade : (ativos[0] ? (ativos[0].quantidadePadrao || '') : '');
 
   const html = `
     <div class="modal-header">
@@ -1030,7 +1038,7 @@ function openEntregaForm(id) {
     <div class="hint" style="margin-bottom:10px;">${TIPO_LABEL[tipo]}</div>
     <div class="field">
       <label>Loja</label>
-      <select id="f-cliente" ${editando ? '' : 'onchange="atualizarValorUnitarioAuto()"'}>${options}</select>
+      <select id="f-cliente" ${editando ? '' : 'onchange="atualizarPadroesLojaAuto()"'}>${options}</select>
     </div>
     <div class="row2">
       <div class="field">
@@ -1039,8 +1047,12 @@ function openEntregaForm(id) {
       </div>
       <div class="field">
         <label>Quantidade</label>
-        <input type="number" id="f-qtd" inputmode="numeric" value="${e ? e.quantidade : ''}" placeholder="0">
+        <input type="number" id="f-qtd" inputmode="numeric" value="${qtdInicial}" placeholder="0">
       </div>
+    </div>
+    <div class="field">
+      <label>Motorista</label>
+      <select id="f-motorista">${motoristaOptionsHtml(e ? e.motorista : '')}</select>
     </div>
     <div class="field">
       <label>Observações da entrega</label>
@@ -1069,18 +1081,29 @@ function openEntregaForm(id) {
   openModal(html);
 }
 
-function atualizarValorUnitarioAuto() {
+function motoristaOptionsHtml(selecionado) {
+  const branco = `<option value="" ${!selecionado ? 'selected' : ''}>Sem motorista definido</option>`;
+  const opcoes = motoristasAtivos().slice().sort((a, b) => a.nome.localeCompare(b.nome)).map(m =>
+    `<option value="${escapeHtml(m.nome)}" ${selecionado === m.nome ? 'selected' : ''}>${escapeHtml(m.nome)}</option>`
+  ).join('');
+  return branco + opcoes;
+}
+
+function atualizarPadroesLojaAuto() {
   const cliente = document.getElementById('f-cliente').value;
   const tipo = TIPO_ATUAL;
   const c = DB.clientes.find(x => x.nome === cliente && x.tipo === tipo);
-  const el = document.getElementById('f-valor-unit');
-  if (el && c && c.valorPadrao) el.value = c.valorPadrao;
+  const elValor = document.getElementById('f-valor-unit');
+  const elQtd = document.getElementById('f-qtd');
+  if (elValor && c && c.valorPadrao) elValor.value = c.valorPadrao;
+  if (elQtd && c && c.quantidadePadrao) elQtd.value = c.quantidadePadrao;
 }
 
 function saveEntrega(id) {
   const cliente = document.getElementById('f-cliente').value;
   const data = document.getElementById('f-data').value;
   const quantidade = Number(document.getElementById('f-qtd').value) || 0;
+  const motorista = document.getElementById('f-motorista').value || null;
   const observacoes = document.getElementById('f-obs').value.trim();
   const valorUnitario = Number(document.getElementById('f-valor-unit').value) || 0;
   const dataPagamento = document.getElementById('f-data-pagto').value || null;
@@ -1096,9 +1119,9 @@ function saveEntrega(id) {
       return;
     }
     const e = DB.entregas.find(x => x.id === id);
-    Object.assign(e, { cliente, data, quantidade, observacoes, valorUnitario, dataPagamento, obsPagamento, updatedAt: Date.now() });
+    Object.assign(e, { cliente, data, quantidade, motorista, observacoes, valorUnitario, dataPagamento, obsPagamento, updatedAt: Date.now() });
   } else {
-    DB.entregas.push({ id: uid('e'), tipo: TIPO_ATUAL, cliente, data, quantidade, observacoes, valorUnitario, dataPagamento, obsPagamento, updatedAt: Date.now(), deletado: false });
+    DB.entregas.push({ id: uid('e'), tipo: TIPO_ATUAL, cliente, data, quantidade, motorista, observacoes, valorUnitario, dataPagamento, obsPagamento, updatedAt: Date.now(), deletado: false });
   }
   saveDB();
   closeModal();
@@ -1170,6 +1193,14 @@ function atualizarValorTotalAutoComum() {
   el.value = valorPadrao ? Math.round(qtd * valorPadrao * 100) / 100 : el.value;
 }
 
+function atualizarPadroesComumAuto() {
+  const cliente = document.getElementById('f-cliente').value;
+  const c = DB.clientes.find(x => x.nome === cliente && x.tipo === 'comum');
+  const elQtd = document.getElementById('f-qtd');
+  if (elQtd && c && c.quantidadePadrao) elQtd.value = c.quantidadePadrao;
+  atualizarValorTotalAutoComum();
+}
+
 function coletarParcelasDoForm() {
   return Array.from(document.querySelectorAll('[data-parcela-row]')).map(row => ({
     id: row.dataset.parcelaId,
@@ -1194,7 +1225,7 @@ function openEntregaFormComum(e, tipo, options) {
     <div class="hint" style="margin-bottom:10px;">${TIPO_LABEL[tipo]}</div>
     <div class="field">
       <label>Loja</label>
-      <select id="f-cliente" ${editando ? '' : 'onchange="atualizarValorTotalAutoComum()"'}>${options}</select>
+      <select id="f-cliente" ${editando ? '' : 'onchange="atualizarPadroesComumAuto()"'}>${options}</select>
     </div>
     <div class="row2">
       <div class="field">
@@ -1205,6 +1236,10 @@ function openEntregaFormComum(e, tipo, options) {
         <label>Quantidade</label>
         <input type="number" id="f-qtd" inputmode="numeric" value="${editando ? e.quantidade : ''}" placeholder="0" ${editando ? '' : 'oninput="atualizarValorTotalAutoComum()"'}>
       </div>
+    </div>
+    <div class="field">
+      <label>Motorista</label>
+      <select id="f-motorista">${motoristaOptionsHtml(e ? e.motorista : '')}</select>
     </div>
     <div class="field">
       <label>Observações da entrega</label>
@@ -1242,6 +1277,7 @@ function saveEntregaComum(id) {
   const cliente = document.getElementById('f-cliente').value;
   const data = document.getElementById('f-data').value;
   const quantidade = Number(document.getElementById('f-qtd').value) || 0;
+  const motorista = document.getElementById('f-motorista').value || null;
   const observacoes = document.getElementById('f-obs').value.trim();
   const parcelas = coletarParcelasDoForm();
 
@@ -1261,9 +1297,9 @@ function saveEntregaComum(id) {
   if (id) {
     if (!confirm('Salvar as alterações feitas nesta entrega?')) return;
     const e = DB.entregas.find(x => x.id === id);
-    Object.assign(e, { cliente, data, quantidade, observacoes, parcelas, updatedAt: Date.now() });
+    Object.assign(e, { cliente, data, quantidade, motorista, observacoes, parcelas, updatedAt: Date.now() });
   } else {
-    DB.entregas.push({ id: uid('e'), tipo: 'comum', cliente, data, quantidade, observacoes, parcelas, updatedAt: Date.now(), deletado: false });
+    DB.entregas.push({ id: uid('e'), tipo: 'comum', cliente, data, quantidade, motorista, observacoes, parcelas, updatedAt: Date.now(), deletado: false });
   }
   saveDB();
   closeModal();
@@ -1808,6 +1844,11 @@ function openClienteForm(id) {
       <div class="hint">Opcional. Preenche automaticamente o valor unitário ao lançar uma nova entrega.</div>
     </div>
     <div class="field">
+      <label>Quantidade padrão entregue nessa loja</label>
+      <input type="number" id="f-qtd-padrao" value="${c && c.quantidadePadrao ? c.quantidadePadrao : ''}" placeholder="0">
+      <div class="hint">Opcional. Preenche automaticamente a quantidade ao lançar uma nova entrega.</div>
+    </div>
+    <div class="field">
       <label>Status</label>
       <select id="f-ativo">
         <option value="true" ${!c || c.ativo !== false ? 'selected' : ''}>Ativa</option>
@@ -1829,6 +1870,7 @@ function saveCliente(id) {
   const contato = document.getElementById('f-contato').value.trim();
   const intervaloPadrao = Number(document.getElementById('f-intervalo').value) || 7;
   const valorPadrao = Number(document.getElementById('f-valor-padrao').value) || 0;
+  const quantidadePadrao = Number(document.getElementById('f-qtd-padrao').value) || 0;
   const ativo = document.getElementById('f-ativo').value === 'true';
 
   if (!nome) { toast('Digite o nome da loja.'); return; }
@@ -1840,12 +1882,12 @@ function saveCliente(id) {
   if (id) {
     const antigo = DB.clientes.find(x => x.id === id);
     const nomeAntigo = antigo.nome;
-    Object.assign(antigo, { nome, endereco, contato, intervaloPadrao, valorPadrao, ativo });
+    Object.assign(antigo, { nome, endereco, contato, intervaloPadrao, valorPadrao, quantidadePadrao, ativo });
     if (nomeAntigo !== nome) {
       DB.entregas.forEach(e => { if (e.cliente === nomeAntigo && e.tipo === tipo) e.cliente = nome; });
     }
   } else {
-    DB.clientes.push({ id: uid('c'), tipo, nome, endereco, contato, intervaloPadrao, valorPadrao, ativo });
+    DB.clientes.push({ id: uid('c'), tipo, nome, endereco, contato, intervaloPadrao, valorPadrao, quantidadePadrao, ativo });
   }
   saveDB();
   closeModal();
@@ -1975,6 +2017,87 @@ function deleteFeriado(id) {
 }
 
 /* =========================================================
+   MOTORISTAS
+   ========================================================= */
+function motoristasAtivos() {
+  return DB.motoristas.filter(m => m.ativo !== false);
+}
+
+function renderMotoristas() {
+  const el = document.getElementById('motoristas-list');
+  const lista = DB.motoristas.slice().sort((a, b) => a.nome.localeCompare(b.nome));
+  if (lista.length === 0) {
+    el.innerHTML = emptyState('🚐', 'Nenhum motorista cadastrado', 'Toque no botão + para adicionar.');
+    return;
+  }
+  el.innerHTML = lista.map(m => `
+    <div class="card" onclick="openMotoristaForm('${m.id}')" style="cursor:pointer;">
+      <div class="card-row">
+        <div>
+          <div class="card-title">${escapeHtml(m.nome)}</div>
+        </div>
+        <span class="badge ${m.ativo === false ? 'grey' : 'green'}">${m.ativo === false ? 'Inativo' : 'Ativo'}</span>
+      </div>
+    </div>
+  `).join('');
+}
+
+function openMotoristaForm(id) {
+  if (!podeGerenciar()) { toast('Só administradores podem editar motoristas.'); return; }
+  const editando = !!id;
+  const m = editando ? DB.motoristas.find(x => x.id === id) : null;
+  const html = `
+    <div class="modal-header">
+      <h2>${editando ? 'Editar motorista' : 'Novo motorista'}</h2>
+      <button class="close-x" onclick="closeModal()">✕</button>
+    </div>
+    <div class="field">
+      <label>Nome do motorista</label>
+      <input type="text" id="f-nome-motorista" value="${m ? escapeHtml(m.nome) : ''}" placeholder="Ex: João">
+    </div>
+    <div class="field">
+      <label>Status</label>
+      <select id="f-ativo-motorista">
+        <option value="true" ${!m || m.ativo !== false ? 'selected' : ''}>Ativo</option>
+        <option value="false" ${m && m.ativo === false ? 'selected' : ''}>Inativo</option>
+      </select>
+    </div>
+    <div class="formbtns">
+      <button class="btn ghost block" onclick="closeModal()">Cancelar</button>
+      <button class="btn primary block" onclick="saveMotorista(${editando ? `'${id}'` : 'null'})">Salvar</button>
+    </div>
+    ${editando ? `<button class="danger-link" onclick="deleteMotorista('${id}')">Excluir este motorista</button>` : ''}
+  `;
+  openModal(html);
+}
+
+function saveMotorista(id) {
+  const nome = document.getElementById('f-nome-motorista').value.trim();
+  const ativo = document.getElementById('f-ativo-motorista').value === 'true';
+  if (!nome) { toast('Digite o nome do motorista.'); return; }
+  const nomeDuplicado = DB.motoristas.some(m => m.nome === nome && m.id !== id);
+  if (nomeDuplicado) { toast('Já existe um motorista com esse nome.'); return; }
+  if (id) {
+    Object.assign(DB.motoristas.find(x => x.id === id), { nome, ativo });
+  } else {
+    DB.motoristas.push({ id: uid('m'), nome, ativo });
+  }
+  saveDB();
+  closeModal();
+  refreshAll();
+  toast('Motorista salvo.');
+}
+
+function deleteMotorista(id) {
+  if (!confirm('Excluir este motorista?')) return;
+  DB.motoristas = DB.motoristas.filter(x => x.id !== id);
+  saveDB();
+  closeModal();
+  refreshAll();
+  toast('Motorista excluído.');
+}
+
+/* =========================================================
    Helpers de UI
    ========================================================= */
 function emptyState(icone, titulo, texto) {
@@ -2072,7 +2195,7 @@ function triggerImport() {
 
 async function fazerBackupDeSeguranca() {
   const timestamp = Date.now();
-  const snapshot = { clientes: DB.clientes, feriados: DB.feriados, entregas: DB.entregas, criadoEm: timestamp };
+  const snapshot = { clientes: DB.clientes, feriados: DB.feriados, entregas: DB.entregas, motoristas: DB.motoristas, criadoEm: timestamp };
   try {
     localStorage.setItem('picole_backup_pre_import', JSON.stringify(snapshot));
   } catch (e) {
@@ -2107,6 +2230,7 @@ function restaurarBackupLocal() {
   DB.clientes = snapshot.clientes || [];
   DB.feriados = snapshot.feriados || [];
   DB.entregas = snapshot.entregas || [];
+  DB.motoristas = snapshot.motoristas || [];
   migrarTipos();
   saveDB();
   refreshAll();
@@ -2156,10 +2280,12 @@ function importarWorkbook(wb) {
       const ativoRaw = String(r['Ativo'] || '').trim().toLowerCase();
       const ativo = !['não', 'nao', 'false', 'inativo'].includes(ativoRaw);
       novo.clientes.push({
-        id: uid('c'), nome,
+        id: uid('c'), tipo: 'personalizada', nome,
         endereco: String(r['Endereço'] || r['Endereco'] || ''),
         contato: String(r['Contato'] || ''),
         intervaloPadrao: Number(r['Intervalo Padrao Dias']) || 7,
+        valorPadrao: Number(r['Valor Padrao'] || r['Valor Padrão']) || 0,
+        quantidadePadrao: Number(r['Quantidade Padrao'] || r['Quantidade Padrão']) || 0,
         ativo,
       });
     });
@@ -2184,7 +2310,8 @@ function importarWorkbook(wb) {
       const quantidade = Number(r['Quantidade']) || 0;
       if (!dataKey || !cliente || quantidade <= 0) return;
       novo.entregas.push({
-        id: String(r['ID'] || '').trim() || uid('e'), data: dataKey, cliente, quantidade,
+        id: String(r['ID'] || '').trim() || uid('e'), tipo: 'personalizada', data: dataKey, cliente, quantidade,
+        motorista: String(r['Motorista'] || '').trim() || null,
         observacoes: String(r['Observações'] || r['Observacoes'] || ''),
         valorUnitario: Number(r['Valor Unitario'] || r['Valor Unitário']) || 0,
         dataPagamento: excelDateToKey(r['Data Pagamento']),
@@ -2195,8 +2322,17 @@ function importarWorkbook(wb) {
     });
   }
 
-  DB = novo;
-  migrarTipos(); // planilha tradicional não tem tipo -> vira "personalizada"
+  // essa planilha tradicional só cobre "Entregas Personalizadas": preserva Comuns, Diretas e motoristas já existentes
+  const clientesOutrosTipos = DB.clientes.filter(c => c.tipo !== 'personalizada');
+  const entregasOutrosTipos = DB.entregas.filter(e => e.tipo !== 'personalizada');
+
+  DB = {
+    clientes: [...novo.clientes, ...clientesOutrosTipos],
+    feriados: novo.feriados,
+    entregas: [...novo.entregas, ...entregasOutrosTipos],
+    motoristas: DB.motoristas || [],
+  };
+  migrarTipos();
   saveDB();
   refreshAll();
   showScreen('painel');
@@ -2221,6 +2357,8 @@ async function exportarPlanilha() {
     'Endereço': c.endereco || '',
     'Contato': c.contato || '',
     'Intervalo Padrao Dias': c.intervaloPadrao,
+    'Valor Padrao': c.valorPadrao || '',
+    'Quantidade Padrao': c.quantidadePadrao || '',
     'Ativo': c.ativo === false ? 'Não' : 'Sim',
   }));
   XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(clientesRows), 'Clientes');
@@ -2231,11 +2369,18 @@ async function exportarPlanilha() {
   }));
   XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(feriadosRows), 'Feriados');
 
+  const motoristasRows = DB.motoristas.slice().sort((a, b) => a.nome.localeCompare(b.nome)).map(m => ({
+    'Nome': m.nome,
+    'Ativo': m.ativo === false ? 'Não' : 'Sim',
+  }));
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(motoristasRows), 'Motoristas');
+
   const entregasRows = entregasAtivas().slice().sort((a, b) => a.data.localeCompare(b.data)).map(e => ({
     'ID': e.id,
     'Data': fmtDateBR(e.data),
     'Cliente': e.cliente,
     'Quantidade': e.quantidade,
+    'Motorista': e.motorista || '',
     'Observações': e.observacoes || '',
     'Valor Unitario': e.valorUnitario || 0,
     'Valor Total': valorTotalEntrega(e),
