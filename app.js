@@ -2235,6 +2235,7 @@ async function fazerBackupDeSeguranca() {
 }
 
 function restaurarBackupLocal() {
+  if (!podeImportar()) { toast('Só administradores podem restaurar backups.'); return; }
   const raw = localStorage.getItem('picole_backup_pre_import');
   if (!raw) { toast('Nenhum backup local encontrado neste aparelho.'); return; }
   let snapshot;
@@ -2272,6 +2273,7 @@ function restaurarBackupLocal() {
 }
 
 function confirmarRestaurarBackupLocal() {
+  if (!podeImportar()) { toast('Só administradores podem restaurar backups.'); closeModal(); return; }
   const digitado = (document.getElementById('f-confirma-restaurar').value || '').trim().toUpperCase();
   if (digitado !== 'RESTAURAR') { toast('Digite RESTAURAR (em maiúsculas) para confirmar.'); return; }
 
@@ -2300,6 +2302,7 @@ function confirmarRestaurarBackupLocal() {
 }
 
 function desfazerRestauracao() {
+  if (!podeImportar()) { toast('Só administradores podem desfazer uma restauração.'); return; }
   const raw = localStorage.getItem('picole_backup_antes_de_restaurar');
   if (!raw) { toast('Não há uma restauração recente para desfazer neste aparelho.'); return; }
   let snapshot;
