@@ -66,11 +66,11 @@ function normalizarTexto(s) {
 }
 function normalizarTipoImportado(valor) {
   const v = normalizarTexto(valor);
-  if (!v) return 'personalizada';
-  if (v.startsWith('comum')) return 'comum';
-  if (v.startsWith('direta') || v.startsWith('diretas')) return 'direta';
-  if (v.startsWith('personalizada')) return 'personalizada';
-  return TIPOS_CLIENTE.includes(v) ? v : 'personalizada';
+  if (!v) return null; // célula vazia — quem chama decide o que fazer (ex: manter o tipo que já tinha)
+  if (v === 'comum' || v === 'comuns') return 'comum';
+  if (v === 'direta' || v === 'diretas') return 'direta';
+  if (v === 'personalizada' || v === 'personalizadas') return 'personalizada';
+  return TIPOS_CLIENTE.includes(v) ? v : null; // texto não reconhecido — também cai no fallback
 }
 
 function setTipoAtual(tipo) {
@@ -2283,6 +2283,20 @@ function excelDateToKey(v) {
 
 function importarWorkbook(wb) {
   const novo = { clientes: [], feriados: [], entregas: [] };
+  let semTipoReconhecido = 0;
+
+  // capturados ANTES de qualquer substituição, para servir de fallback quando a célula "Tipo" vier vazia
+  const clienteAntigoPorId = new Map(DB.clientes.map(c => [c.id, c]));
+  const clienteAntigoPorNome = new Map(DB.clientes.map(c => [c.nome, c]));
+  const entregaAntigaPorId = new Map(DB.entregas.map(e => [e.id, e]));
+
+  function resolverTipo(celulaTipo, existente) {
+    const tipoDetectado = normalizarTipoImportado(celulaTipo); // null = vazia ou não reconhecida
+    if (tipoDetectado) return tipoDetectado;
+    if (existente) return existente.tipo;
+    semTipoReconhecido++;
+    return 'personalizada';
+  }
 
   const shClientes = wb.Sheets['Clientes'];
   if (shClientes) {
@@ -2291,8 +2305,10 @@ function importarWorkbook(wb) {
       if (!nome) return;
       const ativoRaw = String(r['Ativo'] || '').trim().toLowerCase();
       const ativo = !['não', 'nao', 'false', 'inativo'].includes(ativoRaw);
+      const idCelula = String(r['ID'] || '').trim();
+      const existente = clienteAntigoPorId.get(idCelula) || clienteAntigoPorNome.get(nome);
       novo.clientes.push({
-        id: uid('c'), tipo: normalizarTipoImportado(r['Tipo']), nome,
+        id: uid('c'), tipo: resolverTipo(r['Tipo'], existente), nome,
         endereco: String(r['Endereço'] || r['Endereco'] || ''),
         contato: String(r['Contato'] || ''),
         intervaloPadrao: Number(r['Intervalo Padrao Dias']) || 7,
@@ -2339,8 +2355,8 @@ function importarWorkbook(wb) {
       const cliente = String(r['Cliente'] || '').trim();
       const quantidade = Number(r['Quantidade']) || 0;
       if (!dataKey || !cliente || quantidade <= 0) return;
-      const tipo = normalizarTipoImportado(r['Tipo']);
       const id = String(r['ID'] || '').trim() || uid('e');
+      const tipo = resolverTipo(r['Tipo'], entregaAntigaPorId.get(id));
       const base = {
         id, tipo, data: dataKey, cliente, quantidade,
         motorista: String(r['Motorista'] || '').trim() || null,
@@ -2392,7 +2408,10 @@ function importarWorkbook(wb) {
   saveDB();
   refreshAll();
   showScreen('painel');
-  toast(`Importado: ${novo.clientes.length} loja(s), ${importadas} entrega(s).`);
+  const avisoTipo = semTipoReconhecido > 0
+    ? ` ⚠️ ${semTipoReconhecido} linha(s) sem coluna "Tipo" preenchida foram assumidas como Personalizadas.`
+    : '';
+  toast(`Importado: ${novo.clientes.length} loja(s), ${importadas} entrega(s).${avisoTipo}`);
 }
 
 async function exportarPlanilha() {
@@ -2407,8 +2426,8 @@ async function exportarPlanilha() {
 
   const wb = XLSX.utils.book_new();
 
-  const clientesRows = DB.clientes.map((c, i) => ({
-    'ID': i + 1,
+  const clientesRows = DB.clientes.map((c) => ({
+    'ID': c.id,
     'Tipo': TIPO_LABEL_CURTO[c.tipo] || 'Personalizadas',
     'Nome da Loja': c.nome,
     'Endereço': c.endereco || '',
