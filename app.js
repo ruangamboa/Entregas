@@ -61,6 +61,18 @@ const TIPO_LABEL_CURTO = {
 let TIPO_ATUAL = localStorage.getItem('picole_tipo_atual') || 'personalizada';
 if (!TIPOS_CLIENTE.includes(TIPO_ATUAL)) TIPO_ATUAL = 'personalizada';
 
+function normalizarTexto(s) {
+  return String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim().toLowerCase();
+}
+function normalizarTipoImportado(valor) {
+  const v = normalizarTexto(valor);
+  if (!v) return 'personalizada';
+  if (v.startsWith('comum')) return 'comum';
+  if (v.startsWith('direta') || v.startsWith('diretas')) return 'direta';
+  if (v.startsWith('personalizada')) return 'personalizada';
+  return TIPOS_CLIENTE.includes(v) ? v : 'personalizada';
+}
+
 function setTipoAtual(tipo) {
   if (!TIPOS_CLIENTE.includes(tipo)) return;
   TIPO_ATUAL = tipo;
@@ -2280,7 +2292,7 @@ function importarWorkbook(wb) {
       const ativoRaw = String(r['Ativo'] || '').trim().toLowerCase();
       const ativo = !['não', 'nao', 'false', 'inativo'].includes(ativoRaw);
       novo.clientes.push({
-        id: uid('c'), tipo: 'personalizada', nome,
+        id: uid('c'), tipo: normalizarTipoImportado(r['Tipo']), nome,
         endereco: String(r['Endereço'] || r['Endereco'] || ''),
         contato: String(r['Contato'] || ''),
         intervaloPadrao: Number(r['Intervalo Padrao Dias']) || 7,
@@ -2301,6 +2313,24 @@ function importarWorkbook(wb) {
   }
   if (novo.feriados.length === 0) novo.feriados = FERIADOS_PADRAO.map(([data, descricao]) => ({ id: uid('f'), data, descricao }));
 
+  // Parcelas (Entregas Comuns) ficam numa aba à parte, ligadas pela coluna "ID Entrega"
+  const parcelasPorEntrega = new Map();
+  const shParcelas = wb.Sheets['Parcelas'];
+  if (shParcelas) {
+    XLSX.utils.sheet_to_json(shParcelas, { defval: '' }).forEach(r => {
+      const idEntrega = String(r['ID Entrega'] || '').trim();
+      const vencimento = excelDateToKey(r['Vencimento']);
+      if (!idEntrega || !vencimento) return;
+      if (!parcelasPorEntrega.has(idEntrega)) parcelasPorEntrega.set(idEntrega, []);
+      parcelasPorEntrega.get(idEntrega).push({
+        id: uid('p'),
+        valor: Number(r['Valor Parcela']) || 0,
+        vencimento,
+        dataPagamento: excelDateToKey(r['Data Pagamento']),
+      });
+    });
+  }
+
   let importadas = 0;
   const shEntregas = wb.Sheets['Entregas'];
   if (shEntregas) {
@@ -2309,28 +2339,54 @@ function importarWorkbook(wb) {
       const cliente = String(r['Cliente'] || '').trim();
       const quantidade = Number(r['Quantidade']) || 0;
       if (!dataKey || !cliente || quantidade <= 0) return;
-      novo.entregas.push({
-        id: String(r['ID'] || '').trim() || uid('e'), tipo: 'personalizada', data: dataKey, cliente, quantidade,
+      const tipo = normalizarTipoImportado(r['Tipo']);
+      const id = String(r['ID'] || '').trim() || uid('e');
+      const base = {
+        id, tipo, data: dataKey, cliente, quantidade,
         motorista: String(r['Motorista'] || '').trim() || null,
         observacoes: String(r['Observações'] || r['Observacoes'] || ''),
-        valorUnitario: Number(r['Valor Unitario'] || r['Valor Unitário']) || 0,
-        dataPagamento: excelDateToKey(r['Data Pagamento']),
-        obsPagamento: String(r['Observações de Pagamento'] || r['Observacoes de Pagamento'] || ''),
         updatedAt: Date.now(), deletado: false,
-      });
+      };
+      if (tipo === 'comum') {
+        const parcelas = parcelasPorEntrega.get(id) || gerarParcelasPadrao(1, Number(r['Valor Total']) || 0, dataKey, 30);
+        novo.entregas.push({ ...base, parcelas });
+      } else {
+        novo.entregas.push({
+          ...base,
+          valorUnitario: Number(r['Valor Unitario'] || r['Valor Unitário']) || 0,
+          dataPagamento: excelDateToKey(r['Data Pagamento']),
+          obsPagamento: String(r['Observações de Pagamento'] || r['Observacoes de Pagamento'] || ''),
+        });
+      }
       importadas++;
     });
   }
 
-  // essa planilha tradicional só cobre "Entregas Personalizadas": preserva Comuns, Diretas e motoristas já existentes
-  const clientesOutrosTipos = DB.clientes.filter(c => c.tipo !== 'personalizada');
-  const entregasOutrosTipos = DB.entregas.filter(e => e.tipo !== 'personalizada');
+  // Motoristas: mescla com os já cadastrados em vez de substituir (evita perder motoristas se a aba não vier)
+  const shMotoristas = wb.Sheets['Motoristas'];
+  let motoristasFinal = DB.motoristas || [];
+  if (shMotoristas) {
+    XLSX.utils.sheet_to_json(shMotoristas, { defval: '' }).forEach(r => {
+      const nome = String(r['Nome'] || '').trim();
+      if (!nome) return;
+      const ativoRaw = String(r['Ativo'] || '').trim().toLowerCase();
+      const ativo = !['não', 'nao', 'false', 'inativo'].includes(ativoRaw);
+      const existente = motoristasFinal.find(m => m.nome === nome);
+      if (existente) existente.ativo = ativo;
+      else motoristasFinal.push({ id: uid('m'), nome, ativo });
+    });
+  }
+
+  // as lojas/entregas importadas substituem só os tipos presentes na planilha; os demais tipos são preservados
+  const tiposNaPlanilha = new Set(novo.clientes.map(c => c.tipo).concat(novo.entregas.map(e => e.tipo)));
+  const clientesPreservados = DB.clientes.filter(c => !tiposNaPlanilha.has(c.tipo));
+  const entregasPreservadas = DB.entregas.filter(e => !tiposNaPlanilha.has(e.tipo));
 
   DB = {
-    clientes: [...novo.clientes, ...clientesOutrosTipos],
+    clientes: [...novo.clientes, ...clientesPreservados],
     feriados: novo.feriados,
-    entregas: [...novo.entregas, ...entregasOutrosTipos],
-    motoristas: DB.motoristas || [],
+    entregas: [...novo.entregas, ...entregasPreservadas],
+    motoristas: motoristasFinal,
   };
   migrarTipos();
   saveDB();
@@ -2353,6 +2409,7 @@ async function exportarPlanilha() {
 
   const clientesRows = DB.clientes.map((c, i) => ({
     'ID': i + 1,
+    'Tipo': TIPO_LABEL_CURTO[c.tipo] || 'Personalizadas',
     'Nome da Loja': c.nome,
     'Endereço': c.endereco || '',
     'Contato': c.contato || '',
@@ -2375,19 +2432,38 @@ async function exportarPlanilha() {
   }));
   XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(motoristasRows), 'Motoristas');
 
-  const entregasRows = entregasAtivas().slice().sort((a, b) => a.data.localeCompare(b.data)).map(e => ({
+  const entregasAtivasTodas = entregasAtivas().slice().sort((a, b) => a.data.localeCompare(b.data));
+  const entregasRows = entregasAtivasTodas.map(e => ({
     'ID': e.id,
+    'Tipo': TIPO_LABEL_CURTO[e.tipo] || 'Personalizadas',
     'Data': fmtDateBR(e.data),
     'Cliente': e.cliente,
     'Quantidade': e.quantidade,
     'Motorista': e.motorista || '',
     'Observações': e.observacoes || '',
-    'Valor Unitario': e.valorUnitario || 0,
+    'Valor Unitario': e.tipo === 'comum' ? '' : (e.valorUnitario || 0),
     'Valor Total': valorTotalEntrega(e),
-    'Data Pagamento': e.dataPagamento ? fmtDateBR(e.dataPagamento) : '',
-    'Observações de Pagamento': e.obsPagamento || '',
+    'Data Pagamento': e.tipo === 'comum' ? '' : (e.dataPagamento ? fmtDateBR(e.dataPagamento) : ''),
+    'Observações de Pagamento': e.tipo === 'comum' ? '' : (e.obsPagamento || ''),
   }));
   XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(entregasRows), 'Entregas');
+
+  const parcelasRows = [];
+  entregasAtivasTodas.filter(e => e.tipo === 'comum').forEach(e => {
+    (e.parcelas || []).forEach(p => {
+      parcelasRows.push({
+        'ID Entrega': e.id,
+        'Cliente': e.cliente,
+        'Data Entrega': fmtDateBR(e.data),
+        'Valor Parcela': p.valor || 0,
+        'Vencimento': p.vencimento ? fmtDateBR(p.vencimento) : '',
+        'Data Pagamento': p.dataPagamento ? fmtDateBR(p.dataPagamento) : '',
+      });
+    });
+  });
+  if (parcelasRows.length > 0) {
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(parcelasRows), 'Parcelas');
+  }
 
   const painelRows = DB.clientes.filter(c => c.ativo !== false).map(c => {
     const r = calcPainelCliente(c);
