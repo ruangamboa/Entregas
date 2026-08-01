@@ -403,6 +403,8 @@ async function sincronizar(silencioso) {
     const daNuvem = entregasSnap.docs.map(d => d.data());
     DB.entregas = mesclarEntregasPorId(DB.entregas, daNuvem);
 
+    migrarTipos(); // dados vindos da nuvem podem ser de antes dos tipos de cliente existirem
+
     localStorage.setItem(STORAGE_KEY, JSON.stringify(DB));
     if (typeof refreshAll === 'function') refreshAll();
 
@@ -665,7 +667,7 @@ function calcPainelCliente(cliente) {
   const qtds = lista.map(e => Number(e.quantidade) || 0);
 
   const intervalos = [];
-  const taxas = [];
+  const amostras = []; // { taxa, peso } — média ponderada pelos dias úteis de cada intervalo
   for (let i = 0; i < datas.length - 1; i++) {
     const maisRecente = datas[i];
     const maisAntiga = datas[i + 1];
@@ -673,12 +675,17 @@ function calcPainelCliente(cliente) {
     const inicio = addDaysStr(maisAntiga, 1);
     const intervalo = networkDays(inicio, maisRecente, hset);
     intervalos.push(intervalo);
-    if (qtdAntiga > 0 && intervalo > 0) taxas.push(qtdAntiga / intervalo);
+    if (qtdAntiga > 0 && intervalo > 0) {
+      const taxa = qtdAntiga / intervalo;
+      const peso = intervalo * (i === 0 ? 2 : 1); // último intervalo pesa o dobro
+      amostras.push({ taxa, peso });
+    }
   }
 
   let intervaloEstimado = null;
-  if (taxas.length > 0) {
-    const taxaMedia = taxas.reduce((a, b) => a + b, 0) / taxas.length;
+  if (amostras.length > 0) {
+    const somaPesos = amostras.reduce((s, a) => s + a.peso, 0);
+    const taxaMedia = somaPesos > 0 ? amostras.reduce((s, a) => s + a.taxa * a.peso, 0) / somaPesos : null;
     if (qtds[0] > 0 && taxaMedia > 0) intervaloEstimado = qtds[0] / taxaMedia;
   }
   if (intervaloEstimado === null) {
@@ -1013,6 +1020,8 @@ function openEntregaForm(id) {
     return;
   }
 
+  const valorInicial = editando ? e.valorUnitario : (ativos[0] ? (ativos[0].valorPadrao || '') : '');
+
   const html = `
     <div class="modal-header">
       <h2>${editando ? 'Editar entrega' : 'Nova entrega'}</h2>
@@ -1021,7 +1030,7 @@ function openEntregaForm(id) {
     <div class="hint" style="margin-bottom:10px;">${TIPO_LABEL[tipo]}</div>
     <div class="field">
       <label>Loja</label>
-      <select id="f-cliente">${options}</select>
+      <select id="f-cliente" ${editando ? '' : 'onchange="atualizarValorUnitarioAuto()"'}>${options}</select>
     </div>
     <div class="row2">
       <div class="field">
@@ -1039,7 +1048,8 @@ function openEntregaForm(id) {
     </div>
     <div class="field">
       <label>Valor unitário (por picolé)</label>
-      <input type="number" id="f-valor-unit" inputmode="decimal" step="0.01" value="${e ? e.valorUnitario : ''}" placeholder="0,00">
+      <input type="number" id="f-valor-unit" inputmode="decimal" step="0.01" value="${valorInicial}" placeholder="0,00">
+      <div class="hint">${editando ? '' : 'Preenchido automaticamente com o valor padrão da loja, se houver. Pode ajustar.'}</div>
     </div>
     <div class="field">
       <label>Data do pagamento</label>
@@ -1057,6 +1067,14 @@ function openEntregaForm(id) {
     ${editando ? `<button class="danger-link" onclick="deleteEntrega('${id}')">Excluir esta entrega</button>` : ''}
   `;
   openModal(html);
+}
+
+function atualizarValorUnitarioAuto() {
+  const cliente = document.getElementById('f-cliente').value;
+  const tipo = TIPO_ATUAL;
+  const c = DB.clientes.find(x => x.nome === cliente && x.tipo === tipo);
+  const el = document.getElementById('f-valor-unit');
+  if (el && c && c.valorPadrao) el.value = c.valorPadrao;
 }
 
 function saveEntrega(id) {
@@ -1089,15 +1107,21 @@ function saveEntrega(id) {
 }
 
 /* ---------------- Formulário de Entregas Comuns (parcelado) ---------------- */
-function gerarParcelasPadrao(n, valorTotal, dataBase) {
+function getValorPadraoCliente(nome, tipo) {
+  const c = DB.clientes.find(x => x.nome === nome && x.tipo === tipo);
+  return c && c.valorPadrao ? Number(c.valorPadrao) : 0;
+}
+
+function gerarParcelasPadrao(n, valorTotal, dataBase, periodicidadeDias) {
   n = Math.max(1, Math.round(n) || 1);
+  const periodo = Math.max(1, Math.round(periodicidadeDias) || 30);
   const valorParcela = Math.round((valorTotal / n) * 100) / 100;
   const parcelas = [];
   for (let i = 0; i < n; i++) {
     parcelas.push({
       id: uid('p'),
       valor: i === n - 1 ? Math.round((valorTotal - valorParcela * (n - 1)) * 100) / 100 : valorParcela,
-      vencimento: addDaysStr(dataBase, 30 * (i + 1)),
+      vencimento: addDaysStr(dataBase, periodo * (i + 1)),
       dataPagamento: null,
     });
   }
@@ -1131,8 +1155,19 @@ function renderParcelasContainer(parcelas) {
 function recalcularParcelas() {
   const valorTotal = Number(document.getElementById('f-valor-total').value) || 0;
   const n = Number(document.getElementById('f-num-parcelas').value) || 1;
+  const periodicidade = Number(document.getElementById('f-periodicidade').value) || 30;
   const dataBase = document.getElementById('f-data').value || todayStr();
-  renderParcelasContainer(gerarParcelasPadrao(n, valorTotal, dataBase));
+  localStorage.setItem('picole_periodicidade_dias', String(periodicidade));
+  renderParcelasContainer(gerarParcelasPadrao(n, valorTotal, dataBase, periodicidade));
+}
+
+function atualizarValorTotalAutoComum() {
+  const el = document.getElementById('f-valor-total');
+  if (!el || el.dataset.editadoManual === '1') return;
+  const cliente = document.getElementById('f-cliente').value;
+  const qtd = Number(document.getElementById('f-qtd').value) || 0;
+  const valorPadrao = getValorPadraoCliente(cliente, 'comum');
+  el.value = valorPadrao ? Math.round(qtd * valorPadrao * 100) / 100 : el.value;
 }
 
 function coletarParcelasDoForm() {
@@ -1146,9 +1181,10 @@ function coletarParcelasDoForm() {
 
 function openEntregaFormComum(e, tipo, options) {
   const editando = !!e;
+  const periodicidadePadrao = Number(localStorage.getItem('picole_periodicidade_dias')) || 30;
   const parcelasIniciais = editando && Array.isArray(e.parcelas) && e.parcelas.length > 0
     ? e.parcelas
-    : gerarParcelasPadrao(1, editando ? valorTotalEntrega(e) : 0, editando ? e.data : todayStr());
+    : gerarParcelasPadrao(1, editando ? valorTotalEntrega(e) : 0, editando ? e.data : todayStr(), periodicidadePadrao);
 
   const html = `
     <div class="modal-header">
@@ -1158,7 +1194,7 @@ function openEntregaFormComum(e, tipo, options) {
     <div class="hint" style="margin-bottom:10px;">${TIPO_LABEL[tipo]}</div>
     <div class="field">
       <label>Loja</label>
-      <select id="f-cliente">${options}</select>
+      <select id="f-cliente" ${editando ? '' : 'onchange="atualizarValorTotalAutoComum()"'}>${options}</select>
     </div>
     <div class="row2">
       <div class="field">
@@ -1167,7 +1203,7 @@ function openEntregaFormComum(e, tipo, options) {
       </div>
       <div class="field">
         <label>Quantidade</label>
-        <input type="number" id="f-qtd" inputmode="numeric" value="${editando ? e.quantidade : ''}" placeholder="0">
+        <input type="number" id="f-qtd" inputmode="numeric" value="${editando ? e.quantidade : ''}" placeholder="0" ${editando ? '' : 'oninput="atualizarValorTotalAutoComum()"'}>
       </div>
     </div>
     <div class="field">
@@ -1178,15 +1214,20 @@ function openEntregaFormComum(e, tipo, options) {
     <div class="row2">
       <div class="field">
         <label>Valor total da entrega</label>
-        <input type="number" id="f-valor-total" step="0.01" value="${editando ? valorTotalEntrega(e) : ''}" placeholder="0,00">
+        <input type="number" id="f-valor-total" step="0.01" value="${editando ? valorTotalEntrega(e) : ''}" placeholder="0,00" oninput="this.dataset.editadoManual='1'">
       </div>
       <div class="field">
         <label>Nº de parcelas</label>
         <input type="number" id="f-num-parcelas" min="1" value="${parcelasIniciais.length}">
       </div>
     </div>
+    <div class="field">
+      <label>Vencer a cada quantos dias</label>
+      <input type="number" id="f-periodicidade" min="1" value="${periodicidadePadrao}">
+      <div class="hint">Ex: 30 = mensal, 7 = semanal. Usado ao gerar as parcelas abaixo.</div>
+    </div>
     <button type="button" class="btn ghost block" style="margin-bottom:10px;" onclick="recalcularParcelas()">🔁 Gerar/recalcular parcelas</button>
-    <div class="hint" style="margin-bottom:8px;">Gerar recria as parcelas abaixo (divide o valor e vencimentos a cada 30 dias). Depois de gerar, você pode ajustar valor, vencimento e marcar cada parcela como paga individualmente.</div>
+    <div class="hint" style="margin-bottom:8px;">Gerar recria as parcelas abaixo (divide o valor e espaça os vencimentos pela periodicidade escolhida). Depois de gerar, você pode ajustar valor, vencimento e marcar cada parcela como paga individualmente.</div>
     <div id="parcelas-container">${parcelasIniciais.map((p, i) => parcelaRowHtml(p, i)).join('')}</div>
     <div class="formbtns" style="margin-top:10px;">
       <button class="btn ghost block" onclick="closeModal()">Cancelar</button>
@@ -1762,6 +1803,11 @@ function openClienteForm(id) {
       <div class="hint">Usado só até a loja acumular pelo menos 2 entregas registradas.</div>
     </div>
     <div class="field">
+      <label>Valor padrão do picolé para essa loja</label>
+      <input type="number" id="f-valor-padrao" step="0.01" value="${c && c.valorPadrao ? c.valorPadrao : ''}" placeholder="0,00">
+      <div class="hint">Opcional. Preenche automaticamente o valor unitário ao lançar uma nova entrega.</div>
+    </div>
+    <div class="field">
       <label>Status</label>
       <select id="f-ativo">
         <option value="true" ${!c || c.ativo !== false ? 'selected' : ''}>Ativa</option>
@@ -1782,6 +1828,7 @@ function saveCliente(id) {
   const endereco = document.getElementById('f-endereco').value.trim();
   const contato = document.getElementById('f-contato').value.trim();
   const intervaloPadrao = Number(document.getElementById('f-intervalo').value) || 7;
+  const valorPadrao = Number(document.getElementById('f-valor-padrao').value) || 0;
   const ativo = document.getElementById('f-ativo').value === 'true';
 
   if (!nome) { toast('Digite o nome da loja.'); return; }
@@ -1793,12 +1840,12 @@ function saveCliente(id) {
   if (id) {
     const antigo = DB.clientes.find(x => x.id === id);
     const nomeAntigo = antigo.nome;
-    Object.assign(antigo, { nome, endereco, contato, intervaloPadrao, ativo });
+    Object.assign(antigo, { nome, endereco, contato, intervaloPadrao, valorPadrao, ativo });
     if (nomeAntigo !== nome) {
       DB.entregas.forEach(e => { if (e.cliente === nomeAntigo && e.tipo === tipo) e.cliente = nome; });
     }
   } else {
-    DB.clientes.push({ id: uid('c'), tipo, nome, endereco, contato, intervaloPadrao, ativo });
+    DB.clientes.push({ id: uid('c'), tipo, nome, endereco, contato, intervaloPadrao, valorPadrao, ativo });
   }
   saveDB();
   closeModal();
@@ -2060,6 +2107,7 @@ function restaurarBackupLocal() {
   DB.clientes = snapshot.clientes || [];
   DB.feriados = snapshot.feriados || [];
   DB.entregas = snapshot.entregas || [];
+  migrarTipos();
   saveDB();
   refreshAll();
   toast('Backup restaurado.');
@@ -2148,6 +2196,7 @@ function importarWorkbook(wb) {
   }
 
   DB = novo;
+  migrarTipos(); // planilha tradicional não tem tipo -> vira "personalizada"
   saveDB();
   refreshAll();
   showScreen('painel');
