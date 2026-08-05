@@ -106,6 +106,10 @@ function migrarTipos() {
   // dados antigos (antes dos tipos de cliente) viram "personalizada"
   DB.clientes.forEach(c => { if (!c.tipo || !TIPOS_CLIENTE.includes(c.tipo)) c.tipo = 'personalizada'; });
   DB.entregas.forEach(e => { if (!e.tipo || !TIPOS_CLIENTE.includes(e.tipo)) e.tipo = 'personalizada'; });
+  // corrige categorias financeiras salvas com tipo "saida" em vez de "despesa" (bug da criação rápida)
+  if (DB.categoriasFinanceiras) {
+    DB.categoriasFinanceiras.forEach(c => { if (c.tipo === 'saida') c.tipo = 'despesa'; });
+  }
 }
 
 function loadDB() {
@@ -2597,11 +2601,12 @@ function onCategoriaLancamentoChange() {
 
 function criarCategoriaRapida() {
   const tipoMov = document.getElementById('f-lanc-tipo').value;
-  const nome = (prompt(`Nome da nova categoria de ${tipoMov === 'entrada' ? 'entrada' : 'despesa'}:`) || '').trim();
+  const tipoCategoria = tipoMov === 'entrada' ? 'entrada' : 'despesa';
+  const nome = (prompt(`Nome da nova categoria de ${tipoCategoria === 'entrada' ? 'entrada' : 'despesa'}:`) || '').trim();
   if (!nome) { atualizarCategoriasLancamentoForm(); return; }
-  const duplicada = DB.categoriasFinanceiras.some(c => c.nome === nome && c.tipo === tipoMov);
+  const duplicada = DB.categoriasFinanceiras.some(c => c.nome === nome && c.tipo === tipoCategoria);
   if (!duplicada) {
-    DB.categoriasFinanceiras.push({ id: uid('cf'), tipo: tipoMov, nome, ativo: true });
+    DB.categoriasFinanceiras.push({ id: uid('cf'), tipo: tipoCategoria, nome, ativo: true });
     saveDB();
   }
   atualizarCategoriasLancamentoForm(nome);
