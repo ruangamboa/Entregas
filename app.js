@@ -1741,18 +1741,27 @@ function confirmarPagamento(id) {
   toast('Pagamento confirmado.');
 }
 
+function dataPagamentoEfetiva(e) {
+  if (Array.isArray(e.parcelas) && e.parcelas.length > 0) {
+    return e.parcelas.map(p => p.dataPagamento).filter(Boolean).sort().slice(-1)[0] || null;
+  }
+  return e.dataPagamento || null;
+}
+
 function abrirHistoricoPagos() {
   const pagos = entregasAtivas(TIPO_ATUAL)
     .filter(e => entregaStatusPagamento(e) === 'pago')
     .slice()
-    .sort((a, b) => (a.data < b.data ? 1 : a.data > b.data ? -1 : 0));
+    .sort((a, b) => {
+      const da = dataPagamentoEfetiva(a) || '';
+      const db = dataPagamentoEfetiva(b) || '';
+      return da < db ? 1 : da > db ? -1 : 0;
+    });
 
   const linhasHtml = pagos.length === 0
     ? emptyState('🧾', 'Nenhum pagamento registrado', 'Assim que marcar uma entrega como paga, ela aparece aqui.')
     : pagos.map(e => {
-        const dataPag = Array.isArray(e.parcelas) && e.parcelas.length > 0
-          ? e.parcelas.map(p => p.dataPagamento).filter(Boolean).sort().slice(-1)[0]
-          : e.dataPagamento;
+        const dataPag = dataPagamentoEfetiva(e);
         return `
         <div class="card" onclick="closeModal(); openEntregaForm('${e.id}')" style="cursor:pointer;">
           <div class="card-row">
