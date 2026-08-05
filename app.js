@@ -636,7 +636,9 @@ function fmtDateBR(s) {
 }
 const MESES_ABREV = ['jan', 'fev', 'mar', 'abr', 'mai', 'jun', 'jul', 'ago', 'set', 'out', 'nov', 'dez'];
 function fmtMesAno(s) {
-  const d = parseDate(s);
+  const completa = (s && s.length === 7) ? s + '-01' : s;
+  const d = parseDate(completa);
+  if (!d || isNaN(d.getTime())) return '—';
   return `${MESES_ABREV[d.getMonth()]}/${d.getFullYear()}`;
 }
 function fmtMoney(v) {
@@ -2350,17 +2352,18 @@ function lancamentosAtivos() {
 /* ---- sincronização automática: pagamentos de entregas -> lançamentos ---- */
 function sincronizarLancamentoAutoEntrega(entrega) {
   garantirCategoriasVenda();
+  const nome = 'Venda ' + entrega.cliente;
   const existente = DB.lancamentos.find(l => !l.deletado && l.origem && l.origem.entregaId === entrega.id && !l.origem.parcelaId);
   if (entrega.dataPagamento) {
     const valor = valorTotalEntrega(entrega);
     if (existente) {
       Object.assign(existente, {
-        valor, data: entrega.dataPagamento, categoria: CATEGORIA_VENDA[entrega.tipo],
+        valor, data: entrega.dataPagamento, categoria: CATEGORIA_VENDA[entrega.tipo], nome,
         observacoes: entrega.obsPagamento || '', updatedAt: Date.now(),
       });
     } else {
       DB.lancamentos.push({
-        id: uid('lc'), tipoMov: 'entrada', categoria: CATEGORIA_VENDA[entrega.tipo], valor,
+        id: uid('lc'), tipoMov: 'entrada', categoria: CATEGORIA_VENDA[entrega.tipo], nome, valor,
         data: entrega.dataPagamento, observacoes: entrega.obsPagamento || '', automatico: true,
         origem: { entregaId: entrega.id, tipoCliente: entrega.tipo },
         criadoPor: AUTH_USER ? AUTH_USER.email : null, updatedAt: Date.now(), deletado: false,
@@ -2374,6 +2377,7 @@ function sincronizarLancamentoAutoEntrega(entrega) {
 
 function sincronizarParcelasComumFinanceiro(entrega) {
   garantirCategoriasVenda();
+  const nome = 'Venda ' + entrega.cliente;
   // remove lançamentos de parcelas que não existem mais nessa entrega (ex: após "recalcular parcelas")
   const idsAtuais = new Set((entrega.parcelas || []).map(p => p.id));
   DB.lancamentos.forEach(l => {
@@ -2387,10 +2391,10 @@ function sincronizarParcelasComumFinanceiro(entrega) {
     if (p.dataPagamento) {
       const valor = Number(p.valor) || 0;
       if (existente) {
-        Object.assign(existente, { valor, data: p.dataPagamento, categoria: CATEGORIA_VENDA[entrega.tipo], updatedAt: Date.now() });
+        Object.assign(existente, { valor, data: p.dataPagamento, categoria: CATEGORIA_VENDA[entrega.tipo], nome, updatedAt: Date.now() });
       } else {
         DB.lancamentos.push({
-          id: uid('lc'), tipoMov: 'entrada', categoria: CATEGORIA_VENDA[entrega.tipo], valor,
+          id: uid('lc'), tipoMov: 'entrada', categoria: CATEGORIA_VENDA[entrega.tipo], nome, valor,
           data: p.dataPagamento, observacoes: '', automatico: true,
           origem: { entregaId: entrega.id, parcelaId: p.id, tipoCliente: entrega.tipo },
           criadoPor: AUTH_USER ? AUTH_USER.email : null, updatedAt: Date.now(), deletado: false,
@@ -2512,10 +2516,6 @@ function openLancamentoForm(id) {
   if (editando && l.automatico) { toast('Esse lançamento é automático (gerado por um pagamento) e não pode ser editado aqui.'); return; }
   const tipoMov = l ? l.tipoMov : 'entrada';
 
-  const optionsCategoria = (tm) => categoriasFinanceirasDoTipo(tm).map(c =>
-    `<option value="${escapeHtml(c.nome)}" ${l && l.categoria === c.nome ? 'selected' : ''}>${escapeHtml(c.nome)}</option>`
-  ).join('');
-
   const html = `
     <div class="modal-header">
       <h2>${editando ? 'Editar lançamento' : 'Novo lançamento'}</h2>
@@ -2530,8 +2530,13 @@ function openLancamentoForm(id) {
     </div>
     <div class="field">
       <label>Categoria</label>
-      <select id="f-lanc-categoria">${optionsCategoria(tipoMov)}</select>
-      ${categoriasFinanceirasDoTipo(tipoMov).length === 0 ? '<div class="hint">Nenhuma categoria cadastrada ainda — crie uma em Financeiro → Categorias.</div>' : ''}
+      <select id="f-lanc-categoria" onchange="onCategoriaLancamentoChange()"></select>
+    </div>
+    <div class="field">
+      <label>Nome</label>
+      <input type="text" id="f-lanc-nome" list="dl-lanc-nomes" value="${l ? escapeHtml(l.nome || '') : ''}" placeholder="Ex: Posto Ipiranga, Salário João">
+      <datalist id="dl-lanc-nomes"></datalist>
+      <div class="hint">Digite um nome novo ou escolha um já usado nessa categoria.</div>
     </div>
     <div class="row2">
       <div class="field">
@@ -2554,31 +2559,73 @@ function openLancamentoForm(id) {
     ${editando ? `<button class="danger-link" onclick="deleteLancamento('${id}')">Excluir este lançamento</button>` : ''}
   `;
   openModal(html);
+  atualizarCategoriasLancamentoForm(l ? l.categoria : null);
 }
 
-function atualizarCategoriasLancamentoForm() {
+const CATEGORIA_NOVA_SENTINEL = '__nova_categoria__';
+
+function atualizarCategoriasLancamentoForm(categoriaSelecionada) {
   const tipoMov = document.getElementById('f-lanc-tipo').value;
   const el = document.getElementById('f-lanc-categoria');
-  el.innerHTML = categoriasFinanceirasDoTipo(tipoMov).map(c => `<option value="${escapeHtml(c.nome)}">${escapeHtml(c.nome)}</option>`).join('');
+  const categorias = categoriasFinanceirasDoTipo(tipoMov);
+  const opcoes = categorias.map(c =>
+    `<option value="${escapeHtml(c.nome)}" ${categoriaSelecionada === c.nome ? 'selected' : ''}>${escapeHtml(c.nome)}</option>`
+  ).join('');
+  const semCategorias = categorias.length === 0
+    ? `<option value="" disabled selected>Nenhuma categoria ainda</option>` : '';
+  el.innerHTML = semCategorias + opcoes + `<option value="${CATEGORIA_NOVA_SENTINEL}">➕ Criar nova categoria...</option>`;
+  atualizarSugestoesNomeLancamento();
+}
+
+function onCategoriaLancamentoChange() {
+  const el = document.getElementById('f-lanc-categoria');
+  if (el.value === CATEGORIA_NOVA_SENTINEL) {
+    criarCategoriaRapida();
+    return;
+  }
+  atualizarSugestoesNomeLancamento();
+}
+
+function criarCategoriaRapida() {
+  const tipoMov = document.getElementById('f-lanc-tipo').value;
+  const nome = (prompt(`Nome da nova categoria de ${tipoMov === 'entrada' ? 'entrada' : 'despesa'}:`) || '').trim();
+  if (!nome) { atualizarCategoriasLancamentoForm(); return; }
+  const duplicada = DB.categoriasFinanceiras.some(c => c.nome === nome && c.tipo === tipoMov);
+  if (!duplicada) {
+    DB.categoriasFinanceiras.push({ id: uid('cf'), tipo: tipoMov, nome, ativo: true });
+    saveDB();
+  }
+  atualizarCategoriasLancamentoForm(nome);
+}
+
+function atualizarSugestoesNomeLancamento() {
+  const categoria = document.getElementById('f-lanc-categoria').value;
+  const dl = document.getElementById('dl-lanc-nomes');
+  if (!dl) return;
+  const nomes = Array.from(new Set(
+    lancamentosAtivos().filter(l => l.categoria === categoria && l.nome).map(l => l.nome)
+  )).sort((a, b) => a.localeCompare(b));
+  dl.innerHTML = nomes.map(n => `<option value="${escapeHtml(n)}"></option>`).join('');
 }
 
 function saveLancamento(id) {
   const tipoMov = document.getElementById('f-lanc-tipo').value;
   const categoria = document.getElementById('f-lanc-categoria').value;
+  const nome = document.getElementById('f-lanc-nome').value.trim();
   const data = document.getElementById('f-lanc-data').value;
   const valor = Number(document.getElementById('f-lanc-valor').value) || 0;
   const observacoes = document.getElementById('f-lanc-obs').value.trim();
 
-  if (!data || !categoria || valor <= 0) {
+  if (!data || !categoria || categoria === CATEGORIA_NOVA_SENTINEL || valor <= 0) {
     toast('Preencha categoria, data e um valor maior que zero.');
     return;
   }
 
   if (id) {
-    Object.assign(DB.lancamentos.find(x => x.id === id), { tipoMov, categoria, data, valor, observacoes, updatedAt: Date.now() });
+    Object.assign(DB.lancamentos.find(x => x.id === id), { tipoMov, categoria, nome, data, valor, observacoes, updatedAt: Date.now() });
   } else {
     DB.lancamentos.push({
-      id: uid('lc'), tipoMov, categoria, data, valor, observacoes, automatico: false, origem: null,
+      id: uid('lc'), tipoMov, categoria, nome, data, valor, observacoes, automatico: false, origem: null,
       criadoPor: AUTH_USER ? AUTH_USER.email : null, updatedAt: Date.now(), deletado: false,
     });
   }
@@ -2628,8 +2675,8 @@ function renderFinLancamentos() {
     <div class="card" ${l.automatico ? '' : `onclick="openLancamentoForm('${l.id}')" style="cursor:pointer;"`}>
       <div class="card-row">
         <div>
-          <div class="card-title">${escapeHtml(l.categoria)}</div>
-          <div class="card-sub">${fmtDateBR(l.data)}${l.automatico ? ' · automático' : ''}</div>
+          <div class="card-title">${l.nome ? escapeHtml(l.nome) : escapeHtml(l.categoria)}</div>
+          <div class="card-sub">${l.nome ? escapeHtml(l.categoria) + ' · ' : ''}${fmtDateBR(l.data)}${l.automatico ? ' · automático' : ''}</div>
         </div>
         <div class="card-title" style="color:${l.tipoMov === 'entrada' ? 'var(--teal-700)' : 'var(--red-ink)'};">
           ${l.tipoMov === 'entrada' ? '+' : '−'} ${fmtMoney(l.valor)}
@@ -2716,8 +2763,8 @@ function renderFinRelatorioResultado() {
       <div class="card">
         <div class="card-row">
           <div>
-            <div class="card-title">${escapeHtml(l.categoria)}</div>
-            <div class="card-sub">${fmtDateBR(l.data)}${l.automatico ? ' · automático' : ''}${l.observacoes ? ' · ' + escapeHtml(l.observacoes) : ''}</div>
+            <div class="card-title">${l.nome ? escapeHtml(l.nome) : escapeHtml(l.categoria)}</div>
+            <div class="card-sub">${l.nome ? escapeHtml(l.categoria) + ' · ' : ''}${fmtDateBR(l.data)}${l.automatico ? ' · automático' : ''}${l.observacoes ? ' · ' + escapeHtml(l.observacoes) : ''}</div>
           </div>
           <div class="card-title" style="color:${l.tipoMov === 'entrada' ? 'var(--teal-700)' : 'var(--red-ink)'};">
             ${l.tipoMov === 'entrada' ? '+' : '−'} ${fmtMoney(l.valor)}
@@ -3275,6 +3322,7 @@ async function exportarPlanilha() {
     'ID': l.id,
     'Tipo': l.tipoMov === 'entrada' ? 'Entrada' : 'Saída',
     'Categoria': l.categoria,
+    'Nome': l.nome || '',
     'Data': fmtDateBR(l.data),
     'Valor': l.valor,
     'Automático': l.automatico ? 'Sim' : 'Não',
