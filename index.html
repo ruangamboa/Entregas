@@ -239,7 +239,7 @@ a.link{color:var(--teal-700);font-weight:700;text-decoration:none;}
       <h1 id="topbar-title">Painel</h1>
       <div class="sub" id="topbar-sub">Entregas Picolé</div>
     </div>
-    <button class="icon-btn" onclick="abrirSeletorAreas()">☰</button>
+    <button class="icon-btn" onclick="abrirMaisDaAreaAtual()">⋯</button>
   </div>
 
   <!-- ============ PAINEL ============ -->
@@ -395,12 +395,12 @@ a.link{color:var(--teal-700);font-weight:700;text-decoration:none;}
     <button class="tab area-entregas active" data-tab="painel" onclick="showScreen('painel')"><span class="ic">📋</span>Painel</button>
     <button class="tab area-entregas" data-tab="entregas" onclick="showScreen('entregas')"><span class="ic">🚚</span>Entregas</button>
     <button class="tab area-entregas" data-tab="pagamentos" onclick="showScreen('pagamentos')"><span class="ic">💰</span>Pagamentos</button>
-    <button class="tab area-entregas" data-tab="mais" onclick="showScreen('mais')"><span class="ic">⋯</span>Mais</button>
 
     <button class="tab area-financeiro" style="display:none;" data-tab="fin-lancamentos" onclick="showScreen('fin-lancamentos')"><span class="ic">💵</span>Lançar</button>
     <button class="tab area-financeiro" style="display:none;" data-tab="fin-relatorio" onclick="showScreen('fin-relatorio')"><span class="ic">📑</span>Relatório</button>
     <button class="tab area-financeiro" style="display:none;" data-tab="fin-resumo" onclick="showScreen('fin-resumo')"><span class="ic">📆</span>Resumo</button>
-    <button class="tab area-financeiro" style="display:none;" data-tab="fin-mais" onclick="showScreen('fin-mais')"><span class="ic">⋯</span>Mais</button>
+
+    <button class="tab" data-tab="areas" onclick="abrirSeletorAreas()"><span class="ic">☰</span>Áreas</button>
   </div>
 </div>
 

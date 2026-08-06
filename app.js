@@ -972,7 +972,7 @@ const TAB_MAP_POR_AREA = {
   entregas: { painel: 'painel', entregas: 'entregas', pagamentos: 'pagamentos' },
   financeiro: { 'fin-lancamentos': 'fin-lancamentos', 'fin-relatorio': 'fin-relatorio', 'fin-resumo': 'fin-resumo' },
 };
-const TAB_PADRAO_POR_AREA = { entregas: 'mais', financeiro: 'fin-mais' };
+const TAB_PADRAO_POR_AREA = { entregas: null, financeiro: null };
 const TELA_INICIAL_POR_AREA = { entregas: 'painel', financeiro: 'fin-lancamentos' };
 
 let AREA_ATUAL = localStorage.getItem('picole_area_atual') || 'entregas';
@@ -980,6 +980,10 @@ if (!AREAS[AREA_ATUAL]) AREA_ATUAL = 'entregas';
 
 function areaDaTela(name) {
   return AREAS.financeiro.includes(name) ? 'financeiro' : 'entregas';
+}
+
+function abrirMaisDaAreaAtual() {
+  showScreen(AREA_ATUAL === 'financeiro' ? 'fin-mais' : 'mais');
 }
 
 function abrirSeletorAreas() {
@@ -2722,6 +2726,7 @@ function renderFinRelatorio() {
         <input type="date" id="fin-rel-fim" value="${hoje}" onchange="renderFinRelatorioResultado()">
       </div>
     </div>
+    <button type="button" class="btn ghost block" id="fin-rel-btn-filtro" style="margin-bottom:12px;" onclick="abrirFiltroCategoriasRelatorio()">🔎 Filtrar categorias</button>
     <div class="pill-select" style="margin-bottom:12px;">
       <button class="active" id="fin-rel-modo-resumido" onclick="setFinRelatorioModo('resumido')">Resumido</button>
       <button id="fin-rel-modo-detalhado" onclick="setFinRelatorioModo('detalhado')">Detalhado</button>
@@ -2729,6 +2734,64 @@ function renderFinRelatorio() {
     <div id="fin-relatorio-resultado"></div>
   `;
   FIN_RELATORIO_MODO = 'resumido';
+  FIN_RELATORIO_CATEGORIAS = null;
+  atualizarBotaoFiltroCategorias();
+  renderFinRelatorioResultado();
+}
+
+let FIN_RELATORIO_CATEGORIAS = null; // null = todas as categorias (sem filtro)
+
+function atualizarBotaoFiltroCategorias() {
+  const btn = document.getElementById('fin-rel-btn-filtro');
+  if (!btn) return;
+  btn.textContent = FIN_RELATORIO_CATEGORIAS
+    ? `🔎 Filtro: ${FIN_RELATORIO_CATEGORIAS.size} categoria${FIN_RELATORIO_CATEGORIAS.size > 1 ? 's' : ''} — toque para ajustar`
+    : '🔎 Filtrar categorias';
+}
+
+function abrirFiltroCategoriasRelatorio() {
+  garantirCategoriasVenda();
+  const entradas = DB.categoriasFinanceiras.filter(c => c.tipo === 'entrada').sort((a, b) => a.nome.localeCompare(b.nome));
+  const despesas = DB.categoriasFinanceiras.filter(c => c.tipo === 'despesa').sort((a, b) => a.nome.localeCompare(b.nome));
+  const marcada = (nome) => !FIN_RELATORIO_CATEGORIAS || FIN_RELATORIO_CATEGORIAS.has(nome);
+
+  const linha = (c) => `
+    <label class="card" style="display:flex;align-items:center;gap:10px;cursor:pointer;padding:10px 14px;margin-bottom:8px;">
+      <input type="checkbox" class="chk-filtro-categoria" value="${escapeHtml(c.nome)}" ${marcada(c.nome) ? 'checked' : ''} style="width:18px;height:18px;">
+      <span>${escapeHtml(c.nome)}</span>
+    </label>`;
+
+  const html = `
+    <div class="modal-header">
+      <h2>Filtrar categorias</h2>
+      <button class="close-x" onclick="closeModal()">✕</button>
+    </div>
+    <div class="row2" style="margin-bottom:12px;">
+      <button type="button" class="btn ghost block" onclick="marcarTodasCategoriasFiltro(true)">Marcar todas</button>
+      <button type="button" class="btn ghost block" onclick="marcarTodasCategoriasFiltro(false)">Desmarcar todas</button>
+    </div>
+    <div class="section-title">Entradas</div>
+    ${entradas.map(linha).join('') || emptyState('', 'Nenhuma categoria de entrada', '')}
+    <div class="section-title" style="margin-top:14px;">Despesas</div>
+    ${despesas.map(linha).join('') || emptyState('', 'Nenhuma categoria de despesa', '')}
+    <div class="formbtns" style="margin-top:14px;">
+      <button class="btn ghost block" onclick="closeModal()">Cancelar</button>
+      <button class="btn primary block" onclick="aplicarFiltroCategoriasRelatorio()">Aplicar</button>
+    </div>
+  `;
+  openModal(html);
+}
+
+function marcarTodasCategoriasFiltro(valor) {
+  document.querySelectorAll('.chk-filtro-categoria').forEach(chk => { chk.checked = valor; });
+}
+
+function aplicarFiltroCategoriasRelatorio() {
+  const todas = Array.from(document.querySelectorAll('.chk-filtro-categoria'));
+  const marcadas = todas.filter(chk => chk.checked).map(chk => chk.value);
+  FIN_RELATORIO_CATEGORIAS = (marcadas.length === todas.length) ? null : new Set(marcadas);
+  closeModal();
+  atualizarBotaoFiltroCategorias();
   renderFinRelatorioResultado();
 }
 
@@ -2744,7 +2807,9 @@ function renderFinRelatorioResultado() {
   const el = document.getElementById('fin-relatorio-resultado');
   if (!el) return;
   const { ini, fim } = relatorioFinanceiroPeriodo();
-  const doPeriodo = lancamentosAtivos().filter(l => l.data >= ini && l.data <= fim);
+  const doPeriodo = lancamentosAtivos().filter(l =>
+    l.data >= ini && l.data <= fim && (!FIN_RELATORIO_CATEGORIAS || FIN_RELATORIO_CATEGORIAS.has(l.categoria))
+  );
   const entradas = doPeriodo.filter(l => l.tipoMov === 'entrada');
   const saidas = doPeriodo.filter(l => l.tipoMov === 'saida');
   const totalEntradas = entradas.reduce((s, l) => s + l.valor, 0);
@@ -2825,9 +2890,12 @@ function renderFinResumoMensal() {
   }
   if (!FIN_RESUMO_MES || !meses.includes(FIN_RESUMO_MES)) FIN_RESUMO_MES = meses[0];
 
-  const seletor = `<select id="fin-resumo-mes-select" onchange="mudarFinResumoMes(this.value)" style="margin-bottom:14px;">
-    ${meses.map(m => `<option value="${m}" ${m === FIN_RESUMO_MES ? 'selected' : ''}>${fmtMesAno(m)}</option>`).join('')}
-  </select>`;
+  const seletor = `<div class="field" style="margin-bottom:14px;">
+    <label>Mês</label>
+    <select id="fin-resumo-mes-select" onchange="mudarFinResumoMes(this.value)">
+      ${meses.map(m => `<option value="${m}" ${m === FIN_RESUMO_MES ? 'selected' : ''}>${fmtMesAno(m)}</option>`).join('')}
+    </select>
+  </div>`;
 
   const doMes = lancamentosAtivos().filter(l => l.data.slice(0, 7) === FIN_RESUMO_MES);
   const entradas = doMes.filter(l => l.tipoMov === 'entrada');
