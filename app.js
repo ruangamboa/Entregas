@@ -2860,7 +2860,7 @@ function renderFinRelatorioResultado() {
     const gruposEntrada = agrupar(entradas);
     const gruposSaida = agrupar(saidas);
     const linhaGrupo = (nome, valor, cor) => `
-      <div class="card">
+      <div class="card" onclick="abrirDetalheCategoriaPeriodo('${escapeHtml(nome)}', '${ini}', '${fim}')" style="cursor:pointer;">
         <div class="card-row">
           <div class="card-title">${escapeHtml(nome)}</div>
           <div class="card-title" style="color:${cor};">${fmtMoney(valor)}</div>
@@ -2872,6 +2872,51 @@ function renderFinRelatorioResultado() {
       `<div class="section-title" style="margin-top:14px;">Saídas por categoria</div>` +
       (gruposSaida.map(([nome, valor]) => linhaGrupo(nome, valor, 'var(--red-ink)')).join('') || emptyState('', 'Sem saídas nesse período', ''));
   }
+}
+
+/* ---- Detalhe de uma categoria (lista de lançamentos, clicável para editar) ---- */
+function abrirDetalheCategoriaLancamentos(categoria, lista) {
+  const ordenada = lista.slice().sort((a, b) => (a.data < b.data ? 1 : a.data > b.data ? -1 : 0));
+  const total = ordenada.reduce((s, l) => s + l.valor, 0);
+
+  const linha = (l) => {
+    let onclick = '';
+    if (l.automatico) {
+      if (l.origem && l.origem.entregaId) onclick = `onclick="closeModal(); openEntregaForm('${l.origem.entregaId}')" style="cursor:pointer;"`;
+    } else {
+      onclick = `onclick="closeModal(); openLancamentoForm('${l.id}')" style="cursor:pointer;"`;
+    }
+    return `
+      <div class="card" ${onclick}>
+        <div class="card-row">
+          <div>
+            <div class="card-title">${l.nome ? escapeHtml(l.nome) : escapeHtml(l.categoria)}</div>
+            <div class="card-sub">${fmtDateBR(l.data)}${l.automatico ? ' · automático (edite pela entrega)' : ''}</div>
+          </div>
+          <div class="card-title" style="color:${l.tipoMov === 'entrada' ? 'var(--teal-700)' : 'var(--red-ink)'};">${fmtMoney(l.valor)}</div>
+        </div>
+      </div>`;
+  };
+
+  const html = `
+    <div class="modal-header">
+      <h2>${escapeHtml(categoria)}</h2>
+      <button class="close-x" onclick="closeModal()">✕</button>
+    </div>
+    <div class="hint" style="margin-bottom:12px;">${ordenada.length} lançamento${ordenada.length !== 1 ? 's' : ''} · ${fmtMoney(total)}</div>
+    ${ordenada.map(linha).join('') || emptyState('', 'Nada aqui', '')}
+  `;
+  openModal(html);
+}
+
+function abrirDetalheCategoriaPeriodo(categoria, ini, fim) {
+  const lista = lancamentosAtivos().filter(l => l.categoria === categoria && l.data >= ini && l.data <= fim);
+  abrirDetalheCategoriaLancamentos(categoria, lista);
+}
+
+function abrirDetalheCategoriaMes(categoria, mesKey) {
+  const lista = lancamentosAtivos().filter(l => l.categoria === categoria && l.data.slice(0, 7) === mesKey);
+  abrirDetalheCategoriaLancamentos(categoria, lista);
 }
 
 /* ---- Tela: Resumo mensal financeiro ---- */
@@ -2910,7 +2955,7 @@ function renderFinResumoMensal() {
     return Array.from(mapa.entries()).sort((a, b) => b[1] - a[1]);
   };
   const linhaGrupo = (nome, valor, cor) => `
-    <div class="card">
+    <div class="card" onclick="abrirDetalheCategoriaMes('${escapeHtml(nome)}', '${FIN_RESUMO_MES}')" style="cursor:pointer;">
       <div class="card-row">
         <div class="card-title">${escapeHtml(nome)}</div>
         <div class="card-title" style="color:${cor};">${fmtMoney(valor)}</div>
